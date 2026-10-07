@@ -1,0 +1,12 @@
+﻿[package]
+name = "cad-doc"
+description = "Modelo de documento: entidades, layers, blocos, undo/redo, indice espacial."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cad-core = { workspace = true }
+cad-geom = { workspace = true }

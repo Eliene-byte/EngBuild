@@ -1,0 +1,18 @@
+# Build artefacts
+/target
+**/*.rs.bk
+*.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+
+# CADKit project files produced at runtime
+*.cad
+*.dxf
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store

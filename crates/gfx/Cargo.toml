@@ -1,0 +1,16 @@
+[package]
+name = "cad-gfx"
+description = "Renderizador wgpu: pipelines 2D/3D, batches e shaders."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cad-core = { workspace = true }
+cad-geom = { workspace = true }
+cad-doc = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }

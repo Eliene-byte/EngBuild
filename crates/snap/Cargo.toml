@@ -1,0 +1,13 @@
+﻿[package]
+name = "cad-snap"
+description = "Motor de object snaps (endpoint, midpoint, perpendicular, tangente...)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cad-core = { workspace = true }
+cad-geom = { workspace = true }
+cad-doc = { workspace = true }

@@ -1,0 +1,11 @@
+﻿[package]
+name = "cad-geom"
+description = "Primitivas de curva, tesselacao e intersecoes robustas."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cad-core = { workspace = true }

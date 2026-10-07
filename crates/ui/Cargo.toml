@@ -1,0 +1,12 @@
+[package]
+name = "cad-ui"
+description = "Toolkit de widgets desenhado sobre wgpu (menus, paineis, campos, texto)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cad-core = { workspace = true }
+cad-gfx = { workspace = true }

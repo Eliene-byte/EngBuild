@@ -1,0 +1,21 @@
+# The application builds on GitHub Actions (see .github/workflows/build.yml),
+# which uses the official MSVC / Linux / macOS images.
+#
+# This file only exists for local iteration on a machine that has no Visual
+# Studio Build Tools: the windows-gnu toolchain ships a self-contained MinGW
+# sysroot plus rust-lld, which is enough to typecheck the pure-Rust crates.
+#
+# wgpu and winit cannot link here (they need a real DLL import library), so
+# those crates are built in CI only.
+
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld"
+rustflags = [
+    "-C", "linker-flavor=ld.lld",
+    "-C", "target-feature=+crt-static",
+]
+
+[alias]
+t = "test --workspace"
+b = "build --workspace"
+check-all = "check --workspace --all-targets"

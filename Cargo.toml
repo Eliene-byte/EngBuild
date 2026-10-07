@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/geom",
+    "crates/doc",
+    "crates/io",
+    "crates/snap",
+    "crates/gfx",
+    "crates/ui",
+    "crates/app",
+    ".",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Eliene-byte/EngBuild"
+authors = ["CADKit contributors"]
+
+[workspace.dependencies]
+cad-core = { path = "crates/core" }
+cad-geom = { path = "crates/geom" }
+cad-doc = { path = "crates/doc" }
+cad-io = { path = "crates/io" }
+cad-snap = { path = "crates/snap" }
+cad-gfx = { path = "crates/gfx" }
+cad-ui = { path = "crates/ui" }
+cad-app = { path = "crates/app" }
+
+wgpu = { version = "30.0", default-features = false, features = ["std", "wgsl", "dx12", "metal", "vulkan"] }
+winit = { version = "0.30", default-features = false }
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

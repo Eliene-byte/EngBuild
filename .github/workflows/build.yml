@@ -1,0 +1,205 @@
+# Build and release CADKit on GitHub Actions.
+#
+# One job per platform so a macOS or Linux failure never blocks a Windows
+# release. Artifacts are uploaded per-platform and joined in `release`.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------- lint/tests
+  test:
+    name: test + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux window-system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # No GPU in CI, so the headless tests must not need one.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Documentation
+        run: cargo doc --workspace --no-deps
+
+  # ------------------------------------------------------------------- windows
+  windows:
+    name: windows x64
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: win-x64
+
+      - name: Build
+        run: cargo build --release --locked -p cad
+
+      - name: Test
+        run: cargo test --release --locked -p cad -p cad-core -p cad-geom -p cad-doc -p cad-snap -p cad-io -p cad-ui -p cad-app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cad-windows-x64
+          path: target/release/cad.exe
+          if-no-files-found: error
+
+  windows-arm:
+    name: windows arm64
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: win-arm64
+
+      - name: Cross build
+        run: cargo build --release --locked -p cad --target aarch64-pc-windows-msvc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cad-windows-arm64
+          path: target/aarch64-pc-windows-msvc/release/cad.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------- linux
+  linux:
+    name: linux x64
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x64
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev \
+            pkg-config
+
+      - name: Build
+        run: cargo build --release --locked -p cad
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/cad dist/
+          strip dist/cad || true
+          tar -czf cadkit-linux-x86_64.tar.gz -C dist cad
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cad-linux-x64
+          path: cadkit-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------- macos
+  macos:
+    name: macos universal
+    runs-on: macos-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos
+
+      - name: Build universal binary
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked -p cad --target aarch64-apple-darwin
+          cargo build --release --locked -p cad --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/cad \
+            target/aarch64-apple-darwin/release/cad \
+            target/x86_64-apple-darwin/release/cad
+          # Ad-hoc signature so the binary runs on Apple Silicon without a
+          # developer certificate.
+          codesign --force --sign - dist/cad
+          tar -czf cadkit-macos-universal.tar.gz -C dist cad
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cad-macos-universal
+          path: cadkit-macos-universal.tar.gz
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------- release
+  release:
+    name: release
+    needs: [windows, windows-arm, linux, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Bundle
+        run: |
+          mkdir -p release
+          cp artifacts/cad-windows-x64/cad.exe            release/cadkit-windows-x64.exe
+          cp artifacts/cad-windows-arm64/cad.exe          release/cadkit-windows-arm64.exe
+          cp artifacts/cad-linux-x64/cadkit-linux-x86_64.tar.gz    release/
+          cp artifacts/cad-macos-universal/cadkit-macos-universal.tar.gz  release/
+          ls -la release
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
