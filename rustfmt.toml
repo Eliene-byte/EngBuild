@@ -1,5 +1,7 @@
 max_width = 100
 edition = "2024"
-newline_style = "Windows"
+# LF, not CRLF: CI checks out with autocrlf off on Linux and the committed
+# files are LF, so pinning CRLF here would make every run report a diff.
+newline_style = "Unix"
 use_field_init_shorthand = true
 use_try_shorthand = true
