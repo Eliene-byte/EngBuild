@@ -7,9 +7,12 @@
 *.so
 *.dylib
 
-# CADKit project files produced at runtime
+# CADKit project files produced at runtime.
+# Negated under tests/: a DXF test fixture is source, not output, and
+# `include_str!` cannot read a file that was never committed.
 *.cad
 *.dxf
+!crates/*/tests/**/*.dxf
 
 # Editors
 .vscode/
