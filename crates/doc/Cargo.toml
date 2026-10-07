@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "cad-doc"
 description = "Modelo de documento: entidades, layers, blocos, undo/redo, indice espacial."
 version.workspace = true

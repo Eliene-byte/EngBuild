@@ -15,6 +15,9 @@ pub mod batch;
 pub mod pipeline;
 pub mod renderer;
 
-pub use batch::{Batch2d, Batch3d, LineVertex, SolidVertex, UiVertex};
-pub use pipeline::{PipelineSet, ShaderError};
-pub use renderer::{FrameStats, Gpu, GpuError, RenderTarget, SurfaceConfig};
+pub use batch::{
+    Batch2d, Batch3d, LineVertex, LineVertex3d, SolidVertex, UiVertex, push_rect,
+    push_rounded_rect, stroke_rect,
+};
+pub use pipeline::{Globals, PipelineSet, ShaderError};
+pub use renderer::{FrameError, FrameStats, Gpu, GpuError, RenderTarget, SurfaceConfig};

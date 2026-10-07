@@ -120,7 +120,6 @@ impl Rect2 {
             Vec2::new(self.min.x, self.max.y),
         ]
     }
-
     /// Uniform scale that fits `self` inside `target`, preserving aspect.
     #[inline]
     pub fn fit_uniform(self, target: Rect2) -> (f32, Vec2) {

@@ -18,7 +18,6 @@ pub struct LineVertex {
     pub pattern: [f32; 4],
     /// Pixels; 0 means "hairline" (1 device pixel, GPU-independent).
     pub width: f32,
-    pub _pad: [f32; 3],
 }
 
 impl LineVertex {
@@ -29,7 +28,6 @@ impl LineVertex {
             color: color.to_array(),
             pattern: [0.0; 4],
             width,
-            _pad: [0.0; 3],
         }
     }
     pub fn dashed(mut self, on: f32, off: f32, phase: f32) -> Self {
@@ -49,7 +47,10 @@ pub struct UiVertex {
     pub shape: f32,
     pub radius: f32,
     pub border: f32,
-    pub _pad: f32,
+    /// Half-extents of the rectangle the SDF is evaluated over. Only meaningful
+    /// when `shape != 0`; the fragment shader needs them because a screen-space
+    /// quad carries no size of its own.
+    pub half_ext: [f32; 2],
 }
 
 impl UiVertex {
@@ -61,7 +62,7 @@ impl UiVertex {
             shape: 0.0,
             radius: 0.0,
             border: 0.0,
-            _pad: 0.0,
+            half_ext: [0.0, 0.0],
         }
     }
     pub fn rounded(mut self, radius: f32) -> Self {
@@ -74,81 +75,79 @@ impl UiVertex {
         self.border = width;
         self
     }
-    /// Set the per-vertex corner radius/uv origin for SDF rounded rects.
-    pub fn corner(mut self, x: f32, y: f32, u: f32, v: f32, w: f32, h: f32) -> Self {
-        self.pos = [x, y];
-        self.uv = [u * w, v * h];
+    /// Set the SDF half-extents for a rounded rect or outline.
+    pub fn sized(mut self, w: f32, h: f32) -> Self {
+        self.half_ext = [w * 0.5, h * 0.5];
         self
     }
 }
 
 /// Push a rectangle as two triangles into `out`.
+///
+/// `uv` runs from `(0,0)` at the rect's min corner to `(w,h)` at its max corner,
+/// so the fragment shader gets a local coordinate without needing `half_ext`.
 pub fn push_rect(out: &mut Vec<UiVertex>, x: f32, y: f32, w: f32, h: f32, color: Rgba) {
-    let r = UiVertex::rect(0.0, 0.0, w, h, color);
-    out.push(UiVertex {
-        pos: [x, y],
-        uv: [0.0, 0.0],
-        ..r
-    });
-    out.push(UiVertex {
-        pos: [x + w, y],
-        uv: [w, 0.0],
-        ..r
-    });
-    out.push(UiVertex {
-        pos: [x, y + h],
-        uv: [0.0, h],
-        ..r
-    });
-    out.push(UiVertex {
-        pos: [x + w, y],
-        uv: [w, 0.0],
-        ..r
-    });
-    out.push(UiVertex {
-        pos: [x + w, y + h],
-        uv: [w, h],
-        ..r
-    });
-    out.push(UiVertex {
-        pos: [x, y + h],
-        uv: [0.0, h],
-        ..r
-    });
+    let base = UiVertex::rect(0.0, 0.0, 0.0, 0.0, color);
+    let corners: [(f32, f32, f32, f32); 6] = [
+        (x, y, 0.0, 0.0),
+        (x + w, y, w, 0.0),
+        (x, y + h, 0.0, h),
+        (x + w, y, w, 0.0),
+        (x + w, y + h, w, h),
+        (x, y + h, 0.0, h),
+    ];
+    for (px, py, u, v) in corners {
+        out.push(UiVertex {
+            pos: [px, py],
+            uv: [u, v],
+            ..base
+        });
+    }
 }
 
-/// Push a rounded rectangle as two triangles with per-corner SDF radii.
+/// Push a rounded rectangle as two triangles.
+///
+/// The interpolated `uv` is the local coordinate in pixels from the rect's min
+/// corner, so `sd_rounded_rect` can be evaluated without a second uniform.
 pub fn push_rounded_rect(out: &mut Vec<UiVertex>, r: Rect, color: Rgba, radius: f32) {
     let radius = radius.min(r.width() * 0.5).min(r.height() * 0.5).max(0.0);
     let base = UiVertex::rect(0.0, 0.0, 0.0, 0.0, color).rounded(radius);
     let (x0, y0) = (r.min.x, r.min.y);
-    let (x1, y1) = (r.max.x, r.max.y);
-    let corners = [
-        (x0 + radius, y0 + radius, 0.0f32, 0.0f32),
-        (x1 - radius, y0 + radius, 1.0, 0.0),
-        (x0 + radius, y1 - radius, 0.0, 1.0),
-        (x1 - radius, y1 - radius, 1.0, 1.0),
+    let (w, h) = (r.width(), r.height());
+    let corners: [(f32, f32, f32, f32); 6] = [
+        (x0, y0, 0.0, 0.0),
+        (x0 + w, y0, w, 0.0),
+        (x0, y0 + h, 0.0, h),
+        (x0 + w, y0, w, 0.0),
+        (x0 + w, y0 + h, w, h),
+        (x0, y0 + h, 0.0, h),
     ];
-    for (i, (cx, cy, u, v)) in corners.iter().enumerate() {
+    for (px, py, u, v) in corners {
         out.push(UiVertex {
-            pos: [*cx, *cy],
-            uv: [*u * r.width(), *v * r.height()],
+            pos: [px, py],
+            uv: [u, v],
             ..base
         });
-        let _ = i;
     }
-    // 0,1,2  2,1,3
-    let idx = [(0usize, 1usize, 2usize), (2, 1, 3)];
-    for tri in idx {
-        for i in tri {
-            let (cx, cy, u, v) = corners[i];
-            out.push(UiVertex {
-                pos: [cx, cy],
-                uv: [u * r.width(), v * r.height()],
-                ..base
-            });
-        }
-    }
+}
+
+/// Push a rectangle outline as four thin rectangles.
+///
+/// Cheaper and sharper than an SDF outline: no per-fragment distance function
+/// and no alpha blending along the edge.
+pub fn stroke_rect(out: &mut Vec<UiVertex>, r: Rect, color: Rgba, width: f32) {
+    let h = width * 0.5;
+    push_rect(out, r.min.x, r.min.y, r.width(), h, color);
+    push_rect(out, r.min.x, r.max.y - h, r.width(), h, color);
+    push_rect(out, r.min.x, r.min.y + h, h, r.height() - h * 2.0, color);
+    push_rect(
+        out,
+        r.max.x - h,
+        r.min.y + h,
+        h,
+        r.height() - h * 2.0,
+        color,
+    );
 }
 
 /// Rectangle alias so this module does not need the core import everywhere.
@@ -235,14 +234,26 @@ pub struct SolidVertex {
     pub flags: f32,
 }
 
-/// A 3D line vertex (world space, expanded by the shader to pixel width).
+/// A 3D line vertex: one corner of a screen-space quad.
+///
+/// The layout matches `pipeline::line3d_layout` byte for byte:
+/// `pos`(3) + `color`(4) + `width`(1) + `across`(1) + `dir`(3) + `pad`(1)
+/// = 13 floats = 52 bytes.
+///
+/// `pos` is the world-space endpoint this corner is attached to, `dir` the
+/// world-space unit direction of the segment, and `across` is ±1 for the side of
+/// the line. The vertex shader projects both endpoints, works out the screen
+/// perpendicular itself, and offsets by `width * across`, which is how a 3D line
+/// keeps a constant pixel width at any depth.
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 pub struct LineVertex3d {
     pub pos: [f32; 3],
     pub color: [f32; 4],
     pub width: f32,
-    pub _pad: [f32; 3],
+    pub across: f32,
+    pub dir: [f32; 3],
+    pub _pad: f32,
 }
 
 /// Accumulates 3D geometry for one frame.
@@ -280,13 +291,35 @@ impl Batch3d {
         self.triangle(a, b, c, color);
         self.triangle(a, c, d, color);
     }
+    /// Add one segment as six vertices, already expanded into a quad.
+    ///
+    /// Keeping the expansion on the CPU means the vertex shader never needs
+    /// the neighbouring vertex to compute the screen-space offset.
     pub fn segment(&mut self, a: Vec3, b: Vec3, color: Rgba, width: f32) {
-        for p in [a, b] {
+        let d = b - a;
+        let len = d.length();
+        // A zero-length segment has no direction; pick an arbitrary one so the
+        // shader's normalize stays finite instead of producing NaN positions.
+        let dir = if len > 1e-6 { d * (1.0 / len) } else { Vec3::X };
+        let c = color.to_array();
+        let dd = dir.to_array();
+        // Triangles (a+, b+, b-) and (a+, b-, a-).
+        let corners: [(Vec3, f32); 6] = [
+            (a, 1.0),
+            (b, 1.0),
+            (b, -1.0),
+            (a, 1.0),
+            (b, -1.0),
+            (a, -1.0),
+        ];
+        for (p, across) in corners {
             self.lines.push(LineVertex3d {
                 pos: p.to_array(),
-                color: color.to_array(),
+                color: c,
                 width,
-                _pad: [0.0; 3],
+                across,
+                dir: dd,
+                _pad: 0.0,
             });
         }
     }
@@ -364,6 +397,9 @@ mod tests {
         let v = LineVertex::new(Vec2::ZERO, Vec2::X, C, 1.0);
         let bytes: &[u8] = bytemuck::bytes_of(&v);
         assert_eq!(bytes.len(), std::mem::size_of::<LineVertex>());
+        // The struct must have no implicit padding: `bytemuck` enforces that at
+        // compile time via the `Pod` derive, and this pins the actual size.
+        assert_eq!(bytes.len(), 52);
         let u = UiVertex::rect(0.0, 0.0, 1.0, 1.0, C);
         assert_eq!(
             bytemuck::bytes_of(&u).len(),
@@ -394,16 +430,23 @@ mod tests {
     }
 
     #[test]
-    fn polyline_closes_explicitly() {
+    fn polyline_does_not_double_close_an_already_closed_ring() {
         let mut b = Batch2d::new();
-        // Already closed (last == first) must not add a duplicate segment.
+        // Three points where the last equals the first: windows(2) yields two
+        // segments and the closure check must add nothing, or the closing edge
+        // would be drawn twice.
         let pts = [Vec2::ZERO, Vec2::new(10.0, 0.0), Vec2::ZERO];
         b.polyline(&pts, C, 1.0);
-        assert_eq!(
-            b.len(),
-            3,
-            "windows(2) gives 2, closure check must add none"
-        );
+        assert_eq!(b.len(), 2);
+    }
+
+    #[test]
+    fn polyline_skips_the_degenerate_closing_segment() {
+        // Same ring without repeating the first point: closure adds exactly one.
+        let mut b = Batch2d::new();
+        let pts = [Vec2::ZERO, Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0)];
+        b.polyline(&pts, C, 1.0);
+        assert_eq!(b.len(), 3);
     }
 
     #[test]
@@ -454,6 +497,66 @@ mod tests {
             out[0].radius
         );
         assert_eq!(out[0].shape, 1.0);
+    }
+
+    #[test]
+    fn rounded_rect_uv_spans_the_rect() {
+        // The SDF is evaluated from `uv`, so it must cover 0..w and 0..h or the
+        // corner rounding lands in the wrong place.
+        let mut out = Vec::new();
+        push_rounded_rect(&mut out, Rect::from_xywh(4.0, 7.0, 20.0, 30.0), C, 4.0);
+        let us: Vec<f32> = out.iter().map(|v| v.uv[0]).collect();
+        let vs: Vec<f32> = out.iter().map(|v| v.uv[1]).collect();
+        assert!(us.contains(&0.0) && us.contains(&20.0), "{us:?}");
+        assert!(vs.contains(&0.0) && vs.contains(&30.0), "{vs:?}");
+        // Positions are absolute, not offsets.
+        assert_eq!(out[0].pos, [4.0, 7.0]);
+        assert_eq!(out[2].pos, [4.0, 37.0]);
+    }
+
+    #[test]
+    fn stroke_rect_emits_four_bars() {
+        let mut out = Vec::new();
+        stroke_rect(&mut out, Rect::from_xywh(0.0, 0.0, 10.0, 20.0), C, 2.0);
+        assert_eq!(out.len(), 24, "four bars of two triangles each");
+        // Top and bottom bars span the full width.
+        assert_eq!(out[0].pos, [0.0, 0.0]);
+        assert_eq!(out[5].pos, [10.0, 1.0]);
+        // Side bars are inset so corners do not overlap.
+        assert_eq!(out[12].pos, [0.0, 1.0]);
+        assert_eq!(out[18].pos, [9.0, 1.0]);
+    }
+
+    #[test]
+    fn line3d_segment_is_six_finite_vertices() {
+        let mut b = Batch3d::new();
+        b.segment(Vec3::ZERO, Vec3::new(3.0, 4.0, 0.0), C, 1.0);
+        assert_eq!(b.lines.len(), 6);
+        // `dir` is the unit world direction; a 3-4-5 segment normalises to
+        // (0.6, 0.8, 0).
+        for v in &b.lines {
+            assert!(v.dir.iter().all(|f| f.is_finite()), "{v:?}");
+            assert!((v.dir[0] - 0.6).abs() < 1e-5, "{v:?}");
+            assert!((v.dir[1] - 0.8).abs() < 1e-5, "{v:?}");
+            assert_eq!(v.dir[2], 0.0);
+            assert!(v.across == 1.0 || v.across == -1.0, "{v:?}");
+        }
+        // Three corners on each side of the line.
+        assert_eq!(b.lines.iter().filter(|v| v.across > 0.0).count(), 3);
+        assert_eq!(b.lines.iter().filter(|v| v.across < 0.0).count(), 3);
+    }
+
+    #[test]
+    fn zero_length_3d_segment_has_a_finite_direction() {
+        // normalize() of a zero vector is NaN, which would poison every vertex
+        // downstream; the batch must substitute a safe axis.
+        let mut b = Batch3d::new();
+        b.segment(Vec3::ZERO, Vec3::ZERO, C, 1.0);
+        assert_eq!(b.lines.len(), 6);
+        for v in &b.lines {
+            assert!(v.dir.iter().all(|f| f.is_finite()), "{v:?}");
+            assert_eq!(v.dir, [1.0, 0.0, 0.0]);
+        }
     }
 
     #[test]

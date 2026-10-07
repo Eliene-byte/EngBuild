@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "cad-snap"
 description = "Motor de object snaps (endpoint, midpoint, perpendicular, tangente...)."
 version.workspace = true

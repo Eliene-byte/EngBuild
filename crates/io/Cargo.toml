@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "cad-io"
 description = "Importacao/exportacao DXF e formato binario nativo de projeto."
 version.workspace = true

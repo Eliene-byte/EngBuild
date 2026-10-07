@@ -3,7 +3,7 @@
 
 use cad_core::Vec2;
 use cad_doc::{Document, EntityKind};
-use cad_geom::curve::{Arc, Circle, Line};
+use cad_geom::curve::Arc;
 
 fn doc() -> Document {
     Document::new()

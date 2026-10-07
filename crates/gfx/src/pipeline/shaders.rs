@@ -6,7 +6,7 @@
 
 /// Global uniforms shared by every pipeline.
 ///
-/// Layout (std140-compatible, all members 16-byte aligned):
+/// Layout (WGSL uniform address space: `vec2`/`vec3` align to 8/16):
 /// ```wgsl
 /// struct Globals {
 ///   view_proj : mat4x4<f32>,  //  0..63
@@ -15,7 +15,7 @@
 ///   dpr       : f32,         // 76
 ///   time      : f32,         // 80
 ///   frame     : f32,         // 84
-///   _pad      : vec2<f32>,   // 88..95
+///   eye       : vec2<f32>,   // 88..95
 /// }                          // total 96
 /// ```
 pub const GLOBALS_SIZE: u64 = 96;
@@ -29,7 +29,7 @@ struct Globals {
     dpr       : f32,
     time      : f32,
     frame     : f32,
-    pad       : vec2<f32>,
+    eye       : vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> G : Globals;
@@ -45,56 +45,12 @@ fn clip_of(p: vec2<f32>) -> vec4<f32> {
 "#;
 
 /// 2D anti-aliased lines in screen space, with dashes and screen-space width.
-pub const WGSL_LINES_2D: &str = r#"
-struct VIn {
-    @location(0) a       : vec2<f32>,
-    @location(1) b       : vec2<f32>,
-    @location(2) color   : vec4<f32>,
-    @location(3) pattern : vec4<f32>,
-    @location(4) width   : f32,
-};
-
-struct VOut {
-    @builtin(position) pos : vec4<f32>,
-    @location(0) color     : vec4<f32>,
-    @location(1) offset    : f32,
-    @location(2) dir       : vec2<f32>,
-    @location(3) along     : f32,
-    @location(4) length    : f32,
-    @location(5) pattern   : vec4<f32>,
-    @location(6) half_px   : f32,
-};
-
-@vertex
-fn vs(in : VIn) -> VOut {
-    var out : VOut;
-    let d = in.b - in.a;
-    let len = max(length(d), 1e-5);
-    let dir = d / len;
-    let n = vec2<f32>(-dir.y, dir.x);
-
-    // Half width in pixels; 0 means a 1px hairline.
-    let hw = max(in.width, 0.0) * 0.5;
-    let hw_eff = select(0.5, hw, hw > 0.0);
-
-    out.pos = clip_of(in.a);
-    out.color = in.color;
-    out.offset = 0.0;
-    out.dir = dir;
-    out.along = 0.0;
-    out.length = len;
-    out.pattern = in.pattern;
-    out.half_px = hw_eff;
-
-    // Push the second vertex to the far end; we use the quad overdraw trick
-    // below, so emit both extremes via a 6-vertex fan in the CPU batch.
-    return out;
-}
-"#;
-
-/// Simpler and more robust: expand each segment into a quad on the CPU and use a
-/// plain triangle shader. Keeps the GPU code tiny and avoids the degenerate
-/// cases of the single-line primitive at extreme angles.
+///
+/// Each segment is expanded into a quad on the CPU (`expand_lines`), so the
+/// vertex shader is a pure pass-through and the fragment shader only has to
+/// resolve coverage across the line's width. That is what keeps the AA ramp
+/// correct at any angle and avoids the degenerate cases of the single-line
+/// primitive.
 pub const WGSL_LINE_QUAD_2D: &str = r#"
 struct VIn {
     @location(0) pos     : vec2<f32>,
@@ -150,12 +106,13 @@ fn fs(in : VOut) -> @location(0) vec4<f32> {
 /// UI quads: flat fills, rounded-rect SDFs and outlines.
 pub const WGSL_UI: &str = r#"
 struct VIn {
-    @location(0) pos    : vec2<f32>,
-    @location(1) uv     : vec2<f32>,
-    @location(2) color  : vec4<f32>,
-    @location(3) shape  : f32,
-    @location(4) radius : f32,
-    @location(5) border : f32,
+    @location(0) pos      : vec2<f32>,
+    @location(1) uv       : vec2<f32>,
+    @location(2) color    : vec4<f32>,
+    @location(3) shape    : f32,
+    @location(4) radius   : f32,
+    @location(5) border   : f32,
+    @location(6) half_ext : vec2<f32>,
 };
 
 struct VOut {
@@ -165,7 +122,7 @@ struct VOut {
     @location(2) shape       : f32,
     @location(3) radius      : f32,
     @location(4) border      : f32,
-    @location(5) local       : vec2<f32>,
+    @location(5) half_ext    : vec2<f32>,
 };
 
 @vertex
@@ -177,33 +134,32 @@ fn vs(in : VIn) -> VOut {
     out.shape = in.shape;
     out.radius = in.radius;
     out.border = in.border;
-    // Reconstruct the distance field coordinate: distance from the rounded
-    // corner centre equals the box half-extent minus the interpolated uv.
-    out.local = in.uv;
+    out.half_ext = in.half_ext;
     return out;
 }
 
+/// Signed distance to a rounded box centred on the origin.
 fn sd_rounded_rect(p : vec2<f32>, half_ext : vec2<f32>, r : f32) -> f32 {
-    var rr = min(r, min(half_ext.x, half_ext.y));
-    let q = abs(p) - half_ext + vec2<f32>(rr);
-    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - rr;
+    let rr = min(r, min(half_ext.x, half_ext.y));
+    let q = abs(p) - half_ext + vec2<f32>(rr, rr);
+    return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - rr;
 }
 
 @fragment
 fn fs(in : VOut) -> @location(0) vec4<f32> {
+    // Flat fill: no distance field needed.
     if (in.shape < 0.5) {
         return in.color;
     }
-    // Rounded rect / border, evaluated from the interpolated uv.
-    let half_ext = vec2<f32>(0.5, 0.5);
-    let p = in.local - half_ext;
-    let d = sd_rounded_rect(p, half_ext, in.radius);
+    // `uv` is the offset from the rect's min corner, so centre it on the box.
+    let p = in.uv - in.half_ext;
+    let d = sd_rounded_rect(p, in.half_ext, in.radius);
     if (in.shape > 1.5) {
-        // Border only.
+        // Border only: a band of width `border` hugging the outline.
         let w = max(in.border, 0.5);
-        let a = clamp((w - abs(d + w * 0.5)) + 0.5, 0.0, 1.0);
+        let a = clamp(w - abs(d + w * 0.5) + 0.5, 0.0, 1.0) * in.color.a;
         if (a <= 0.0) { discard; }
-        return vec4<f32>(in.color.rgb, a * in.color.a);
+        return vec4<f32>(in.color.rgb, a);
     }
     let a = clamp(0.5 - d, 0.0, 1.0) * in.color.a;
     if (a <= 0.0) { discard; }
@@ -249,66 +205,75 @@ fn fs(in : VOut) -> @location(0) vec4<f32> {
     let sky = mix(vec3<f32>(0.16, 0.17, 0.20), vec3<f32>(0.30, 0.33, 0.38), n.z * 0.5 + 0.5);
     var lit = in.color.rgb * (sky + vec3<f32>(key * 0.85 + fill));
     // Rim light to separate silhouettes, which matters a lot in CAD views.
-    let view_dir = normalize(vec3<f32>(G.pad.x, G.pad.y, 1.0));
-    let rim = pow(1.0 - max(dot(n, view_dir), 0.0), 3.0) * 0.25;
+    let to_eye = vec3<f32>(G.eye.x - in.world.x, G.eye.y - in.world.y, 0.0);
+    let rim = pow(1.0 - max(dot(n, normalize(to_eye)), 0.0), 3.0) * 0.25;
     lit += vec3<f32>(rim);
     return vec4<f32>(lit, in.color.a);
 }
 "#;
 
-/// 3D lines: world-space, expanded to a screen-space quad in the vertex shader.
+/// 3D lines, expanded to a screen-space quad in the vertex shader.
+///
+/// Each vertex carries one endpoint (`pos`), the segment's world-space unit
+/// direction (`dir`) and a side flag (`across`). The shader projects the
+/// segment's two endpoints, derives the screen-space perpendicular, and offsets
+/// by `width * across`. That is what gives a world-space line a constant *pixel*
+/// width regardless of depth — the alternative (constant world-space width) makes
+/// far geometry vanish and near geometry swamp the view.
 pub const WGSL_LINE_3D: &str = r#"
 struct VIn {
-    @location(0) pos   : vec3<f32>,
-    @location(1) color : vec4<f32>,
-    @location(2) width : f32,
-    @location(3) local : vec2<f32>,
+    @location(0) pos    : vec3<f32>,
+    @location(1) color  : vec4<f32>,
+    @location(2) width  : f32,
+    @location(3) across : f32,
+    @location(4) dir    : vec3<f32>,
+    @location(5) _pad   : f32,
 };
 
 struct VOut {
     @builtin(position) pos    : vec4<f32>,
     @location(0) color        : vec4<f32>,
-    @location(1) local        : vec2<f32>,
+    @location(1) across       : f32,
     @location(2) half_px      : f32,
 };
 
-fn project(p : vec3<f32>) -> vec4<f32> {
-    return G.view_proj * vec4<f32>(p, 1.0);
-}
-
 fn to_screen(clip : vec4<f32>) -> vec2<f32> {
-    let ndc = clip.xy / max(clip.w, 1e-6);
-    return vec2<f32>((ndc.x * 0.5 + 0.5) * G.resolution.x, (0.5 - ndc.y * 0.5) * G.resolution.y);
+    let ndc = clip.xy / max(abs(clip.w), 1e-6) * sign(clip.w);
+    return vec2<f32>(
+        (ndc.x * 0.5 + 0.5) * G.resolution.x,
+        (0.5 - ndc.y * 0.5) * G.resolution.y,
+    );
 }
 
 @vertex
 fn vs(in : VIn) -> VOut {
     var out : VOut;
-    let clip = project(in.pos);
-    let screen = to_screen(clip);
+    let clip = G.view_proj * vec4<f32>(in.pos, 1.0);
+    let far = G.view_proj * vec4<f32>(in.pos + in.dir, 1.0);
+
+    // Screen-space direction of the segment; perpendicular is its normal.
+    let d = to_screen(far) - to_screen(clip);
+    let len = max(length(d), 1e-5);
+    let nrm = vec2<f32>(-d.y, d.x) / len;
+
     let hw = max(in.width, 1.0) * 0.5;
-
-    // Offset perpendicular to the screen-space segment, which requires the
-    // neighbouring vertex: `local.y` carries the along-axis sign and
-    // `local.x` the across-axis sign from the CPU.
-    let axis = normalize(vec2<f32>(cos(in.local.y), sin(in.local.y)));
-    let nrm = vec2<f32>(-axis.y, axis.x);
-    let offset_px = nrm * hw * in.local.x;
-
+    let screen = to_screen(clip) + nrm * hw * in.across;
     let ndc = vec2<f32>(
-        ((screen.x + offset_px.x) / G.resolution.x) * 2.0 - 1.0,
-        1.0 - ((screen.y + offset_px.y) / G.resolution.y) * 2.0,
+        (screen.x / G.resolution.x) * 2.0 - 1.0,
+        1.0 - (screen.y / G.resolution.y) * 2.0,
     );
-    out.pos = vec4<f32>(ndc, clip.z / max(clip.w, 1e-6), 1.0);
+
+    out.pos = vec4<f32>(ndc, clip.z / max(abs(clip.w), 1e-6) * sign(clip.w), 1.0);
     out.color = in.color;
-    out.local = in.local;
+    out.across = in.across;
     out.half_px = hw;
     return out;
 }
 
 @fragment
 fn fs(in : VOut) -> @location(0) vec4<f32> {
-    let a = clamp((in.half_px + 0.5 - abs(in.local.x)) * in.color.a, 0.0, 1.0);
+    // Analytic AA: `across` ramps linearly across the quad's half-width.
+    let a = clamp(in.half_px + 0.5 - abs(in.across) * in.half_px, 0.0, 1.0) * in.color.a;
     if (a <= 0.0) { discard; }
     return vec4<f32>(in.color.rgb, a);
 }
@@ -342,7 +307,7 @@ fn fs(in : VOut) -> @location(0) vec4<f32> {
     let g10 = abs(fract(in.world / 10.0) - 0.5) / max(fwidth(in.world / 10.0), vec2<f32>(1e-5));
     let l10 = min(g10.x, g10.y);
 
-    let dist = length(in.world - G.view_proj[3].xy);
+    let dist = length(in.world - G.eye);
     let fade1 = clamp(1.0 - dist / 8.0, 0.0, 1.0);
     let fade10 = clamp(1.0 - dist / 90.0, 0.0, 1.0);
 
@@ -351,39 +316,6 @@ fn fs(in : VOut) -> @location(0) vec4<f32> {
     let a = clamp(a1 + a10, 0.0, 1.0);
     if (a < 0.003) { discard; }
     return vec4<f32>(0.62, 0.66, 0.72, a);
-}
-"#;
-
-/// Simple textured blit used for the glyph atlas.
-pub const WGSL_TEXTURE: &str = r#"
-struct VIn {
-    @location(0) pos   : vec2<f32>,
-    @location(1) uv    : vec2<f32>,
-    @location(2) color : vec4<f32>,
-};
-
-struct VOut {
-    @builtin(position) pos : vec4<f32>,
-    @location(0) uv         : vec2<f32>,
-    @location(1) color      : vec4<f32>,
-};
-
-@group(0) @binding(1) var samp : sampler;
-@group(0) @binding(2) var tex  : texture_2d<f32>;
-
-@vertex
-fn vs(in : VIn) -> VOut {
-    var out : VOut;
-    out.pos = clip_of(in.pos);
-    out.uv = in.uv;
-    out.color = in.color;
-    return out;
-}
-
-@fragment
-fn fs(in : VOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex, samp, in.uv);
-    return vec4<f32>(t.rgb * in.color.rgb, t.a * in.color.a);
 }
 "#;
 
@@ -419,7 +351,7 @@ mod tests {
             "dpr",
             "time",
             "frame",
-            "pad",
+            "eye",
         ] {
             assert!(
                 WGSL_GLOBALS.contains(field),
@@ -430,8 +362,66 @@ mod tests {
 
     #[test]
     fn globals_size_matches_the_wgsl_layout() {
-        // mat4 (64) + vec2 (8) + 4 floats (16) + vec2 pad (8) = 96
+        // mat4 (64) + vec2 (8) + 4 floats (16) + vec2 eye (8) = 96
         assert_eq!(GLOBALS_SIZE, 96);
+    }
+
+    #[test]
+    fn globals_struct_is_not_redeclared_per_shader() {
+        // Each shader is concatenated with WGSL_GLOBALS, so no shader may define
+        // its own `Globals`; a duplicate would be a WGSL redefinition error at
+        // pipeline creation, long after the test suite runs.
+        for (name, src) in [
+            ("line_quad_2d", WGSL_LINE_QUAD_2D),
+            ("ui", WGSL_UI),
+            ("solid_3d", WGSL_SOLID_3D),
+            ("line_3d", WGSL_LINE_3D),
+            ("grid_3d", WGSL_GRID_3D),
+        ] {
+            assert!(!src.contains("struct Globals"), "{name} redeclares Globals");
+        }
+    }
+
+    #[test]
+    fn line_3d_declares_every_vertex_attribute_the_layout_supplies() {
+        // pipeline::line3d_layout feeds 6 locations; a mismatch is a validation
+        // error at pipeline creation, not a compile error here.
+        for loc in 0..6 {
+            assert!(
+                WGSL_LINE_3D.contains(&format!("@location({loc})")),
+                "line_3d is missing location {loc}"
+            );
+        }
+        assert!(
+            WGSL_LINE_3D.contains("in.dir"),
+            "line_3d ignores the segment direction"
+        );
+        assert!(
+            WGSL_LINE_3D.contains("in.across"),
+            "line_3d ignores the side flag"
+        );
+    }
+
+    #[test]
+    fn ui_shader_uses_half_ext_for_the_sdf() {
+        // The SDF needs the box size; a hardcoded 0.5 would only be correct for
+        // 1x1 rects.
+        assert!(WGSL_UI.contains("in.half_ext"));
+        assert!(!WGSL_UI.contains("vec2<f32>(0.5, 0.5)"));
+    }
+
+    #[test]
+    fn shaders_do_not_reference_removed_globals_members() {
+        for (name, src) in [
+            ("solid_3d", WGSL_SOLID_3D),
+            ("line_3d", WGSL_LINE_3D),
+            ("grid_3d", WGSL_GRID_3D),
+        ] {
+            assert!(
+                !src.contains("G.pad"),
+                "{name} still reads the removed G.pad"
+            );
+        }
     }
 
     #[test]

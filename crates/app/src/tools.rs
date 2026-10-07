@@ -633,7 +633,7 @@ pub fn pick(doc: &Document, cam: &Camera2D, world: Vec2, max_dist: f32) -> Optio
 /// Pick every entity whose bounds fall inside a window (crossing selection).
 pub fn pick_window(doc: &Document, window: Rect2, crossing: bool) -> Vec<EntityId> {
     let mut out = Vec::new();
-    let r = if crossing { window } else { window };
+    let r = window;
     for id in doc.entities.candidates_in(r) {
         let Some(e) = doc.entities.get(id) else {
             continue;

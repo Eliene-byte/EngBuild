@@ -4,9 +4,10 @@ use crate::handle::LayerId;
 use cad_core::Rgba;
 
 /// DXF lineweight codes, in hundredths of a millimetre (`-4` = "by layer").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(i16)]
 pub enum LineWeight {
+    #[default]
     ByLayer,
     ByBlock,
     Default,
@@ -33,12 +34,6 @@ pub enum LineWeight {
     W1_58mm,
     W2_00mm,
     W2_11mm,
-}
-
-impl Default for LineWeight {
-    fn default() -> Self {
-        LineWeight::ByLayer
-    }
 }
 
 impl LineWeight {

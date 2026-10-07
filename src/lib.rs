@@ -11,9 +11,20 @@ use cad_app::session::{Session, StatusMessage};
 use cad_core::{Camera2D, Rgba, Rect2, Vec2};
 use cad_doc::EntityId;
 use cad_gfx::batch::{Batch2d, Batch3d, UiVertex, push_rect};
-use cad_gfx::renderer::{Gpu, SurfaceConfig};
+use cad_gfx::renderer::{FrameError, Gpu, SurfaceConfig};
 use cad_ui::input::{Event, InputState, Key, Modifiers, MouseButton, ScrollDelta};
 use cad_ui::theme::Theme;
+use winit::window::Window;
+
+/// The 2D viewport is orthographic top-down, so screen pixels map to clip space
+/// with no transform. Every 2D shader derives its position from `resolution`
+/// alone; this is only here so the 3D pipelines have a sane matrix.
+const IDENTITY: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
 
 /// Panel geometry in CSS pixels, derived from the window size.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,7 +67,9 @@ pub struct App {
     pub session: Session,
     pub input: InputState,
     pub gpu: Gpu,
-    pub window: Arc<wgpu::Window>,
+    /// Held as an `Arc` because `wgpu::Surface` takes ownership of the window
+    /// handle and the event loop still needs to drive it.
+    pub window: Arc<Window>,
     pub panels: Panels,
     pub should_close: bool,
     pub frame: u64,
@@ -70,7 +83,7 @@ pub struct App {
 
 impl App {
     /// Build the app for `window`, creating the GPU device.
-    pub fn new(window: Arc<wgpu::Window>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(window: Arc<Window>) -> Result<Self, Box<dyn std::error::Error>> {
         let size = window.inner_size();
         let dpr = window.scale_factor() as f32;
         let w = size.width as f32 / dpr;
@@ -79,8 +92,6 @@ impl App {
         let mut session = Session::new();
         session.theme = Theme::dark();
         session.viewport.cam2d = Camera2D::new(Vec2::new(w.max(1.0), h.max(1.0)));
-        let panels = Panels::layout(w, h);
-        session.viewport.canvas = panels.canvas;
 
         let gpu = Gpu::new(
             window.clone(),
@@ -91,19 +102,40 @@ impl App {
         input.viewport = Rect2::from_xywh(0.0, 0.0, w, h);
 
         let now = Instant::now();
-        Ok(Self {
+        let mut app = Self {
             session,
             input,
             gpu,
             window,
-            panels,
+            panels: Panels::layout(w, h),
             should_close: false,
             frame: 0,
             command_line: String::new(),
             selection_anchor: None,
             start: now,
             last: now,
-        })
+        };
+        app.relayout();
+        Ok(app)
+    }
+
+    /// Recompute the panel geometry and push it into the session.
+    ///
+    /// Every path that changes the window size or scale factor must go through
+    /// here: panel rects, the camera's viewport and the 3D aspect ratio all
+    /// derive from them, and letting any two disagree is what produces a canvas
+    /// that is offset from where the crosshair actually lands.
+    pub fn relayout(&mut self) {
+        let dpr = self.window.scale_factor() as f32;
+        let size = self.window.inner_size();
+        let (w, h) = (size.width as f32 / dpr, size.height as f32 / dpr);
+        self.panels = Panels::layout(w, h);
+        self.session.viewport.cam2d.viewport = Vec2::new(w.max(1.0), h.max(1.0));
+        self.session.viewport.canvas = self.panels.canvas;
+        self.session.viewport.refresh_target();
+        self.input.viewport = Rect2::from_xywh(0.0, 0.0, w, h);
+        self.gpu.resize(size.width.max(1), size.height.max(1));
+        self.session.dirty = true;
     }
 
     fn now(&self) -> f64 {
@@ -126,14 +158,7 @@ impl App {
         match event {
             winit::event::WindowEvent::CloseRequested => self.should_close = true,
             winit::event::WindowEvent::Resized(size) => {
-                let dpr = self.window.scale_factor() as f32;
-                let w = size.width as f32 / dpr;
-                let h = size.height as f32 / dpr;
-                self.gpu.resize(size.width.max(1), size.height.max(1));
-                self.panels = Panels::layout(w, h);
-                self.session.viewport.cam2d.viewport = Vec2::new(w.max(1.0), h.max(1.0));
-                self.session.viewport.canvas = self.panels.canvas;
-                self.input.viewport = Rect2::from_xywh(0.0, 0.0, w, h);
+                self.relayout();
                 self.input
                     .push(&Event::Resized { width: size.width, height: size.height }, self.now());
             }
@@ -257,10 +282,10 @@ impl App {
             return;
         }
         let factor = if d.y > 0.0 { 1.1 } else { 1.0 / 1.1 };
+        // Zoom about the cursor, in the *device* pixels the camera works in.
         let dpr = self.window.scale_factor() as f32;
         let cursor = self.input.mouse * dpr;
-        self.session.viewport.cam2d.zoom_at(factor, cursor);
-        self.session.dirty = true;
+        self.session.zoom_by_at(factor, cursor);
     }
 
     fn on_key(&mut self, key: Key, mods: Modifiers) {
@@ -408,7 +433,10 @@ impl App {
     }
 
     /// Advance time-dependent state and render.
-    pub fn tick_and_draw(&mut self) -> Result<(), wgpu::SurfaceError> {
+    ///
+    /// A `FrameError::Skip` is not a failure: the window was occluded or the
+    /// frame timed out, and the next one should just be attempted.
+    pub fn tick_and_draw(&mut self) -> Result<(), FrameError> {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
@@ -419,18 +447,18 @@ impl App {
         let (cw, ch) = (size.width as f32, size.height as f32);
         let (lines, solids, ui) = build_geometry(self, dpr);
 
+        // Resolution must be in *device* pixels: the shaders divide by it to get
+        // NDC, so CSS pixels would make every quad `dpr` times too small.
+        // In 2D drafting the "camera" is the orthographic top-down identity, so
+        // 2D geometry needs no matrix at all and the 3D shaders simply see
+        // nothing. A real 3D session would use `viewport.cam3d` here.
         self.gpu.set_globals(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
+            IDENTITY,
             [cw, ch],
             self.session.viewport.cam2d.scale,
             dpr,
             self.session.time,
-            [0.0, 0.0],
+            [self.session.viewport.cam3d.eye.x, self.session.viewport.cam3d.eye.y],
         );
         self.gpu.render(&lines, &ui, &solids)?;
         self.frame += 1;
@@ -686,96 +714,117 @@ fn char_to_key(c: char) -> Option<Key> {
     })
 }
 
+/// The winit application handler.
+///
+/// winit 0.30 deprecated the `FnMut(Event, &ActiveEventLoop)` form of `run` in
+/// favour of `ApplicationHandler`; using the old one would fail CI's
+/// `-D warnings` clippy gate on the deprecation attribute alone.
+#[derive(Default)]
+struct Handler {
+    /// `None` until the first `Resumed`, because winit only guarantees that a
+    /// surface can be created after that event.
+    app: Option<App>,
+}
+
+impl winit::application::ApplicationHandler for Handler {
+    fn resumed(&mut self, elwt: &winit::event_loop::ActiveEventLoop) {
+        if self.app.is_none() {
+            create_window(elwt, &mut self.app);
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        elwt: &winit::event_loop::ActiveEventLoop,
+        _id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        let Some(app) = self.app.as_mut() else {
+            return;
+        };
+        app.on_window_event(&event);
+        match event {
+            winit::event::WindowEvent::CloseRequested => elwt.exit(),
+            winit::event::WindowEvent::ScaleFactorChanged { .. } => {
+                // Panel geometry is in CSS pixels, so a scale change means a
+                // re-layout even though the pixel size may be unchanged.
+                app.relayout();
+            }
+            winit::event::WindowEvent::Occluded(true) => app.session.dirty = true,
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, elwt: &winit::event_loop::ActiveEventLoop) {
+        let Some(app) = self.app.as_mut() else {
+            return;
+        };
+        // Drive redraws from the input stream rather than a timer, which keeps
+        // the CPU idle when nothing is happening.
+        let busy = !app.input.released.is_empty()
+            || !app.input.keys_pressed.is_empty()
+            || !app.input.text.is_empty()
+            || app.input.mouse_delta.length_squared() > 0.0
+            || !app.input.pressed.is_empty()
+            || app.session.dirty
+            || app.input.scroll.y != 0.0;
+        if !busy {
+            return;
+        }
+        app.session.dirty = false;
+        match app.tick_and_draw() {
+            Ok(()) | Err(FrameError::Skip) => {}
+            Err(FrameError::Outdated) | Err(FrameError::Lost) => {
+                let (w, h) = app.window.inner_size();
+                app.gpu.resize(w.max(1), h.max(1));
+            }
+            Err(e @ FrameError::Invalid) => {
+                eprintln!("render error: {e}");
+                elwt.exit();
+            }
+        }
+        app.window.request_redraw();
+    }
+}
+
 /// Create the window and run the event loop until it is closed.
 pub fn main_loop() -> Result<Option<String>, Box<dyn std::error::Error>> {
     let event_loop = winit::event_loop::EventLoop::new()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-
-    let attrs = winit::window::WindowAttributes::default()
-        .with_title("CADKit")
-        .with_inner_size(winit::dpi::LogicalSize::new(1600.0, 900.0))
-        .with_min_inner_size(winit::dpi::LogicalSize::new(900.0, 600.0));
-
-    let mut app: Option<App> = None;
-    event_loop.run(move |event, elwt| {
-        match event {
-            winit::event::Event::WindowEvent { event, .. } => {
-                if let Some(a) = app.as_mut() {
-                    a.on_window_event(&event);
-                    if a.should_close {
-                        elwt.exit();
-                    }
-                } else if matches!(event, winit::event::WindowEvent::Resized(_)) {
-                    // The first event usually arrives before we build the app.
-                    create_window(elwt, &mut app);
-                }
-            }
-            winit::event::Event::AboutToWait => {
-                if app.is_none() {
-                    create_window(elwt, &mut app);
-                }
-                if let Some(a) = app.as_mut() {
-                    // Drive redraws from the input stream, which keeps the CPU
-                    // idle when nothing changes.
-                    let busy = !a.input.released.is_empty()
-                        || !a.input.keys_pressed.is_empty()
-                        || !a.input.text.is_empty()
-                        || a.input.mouse_delta.length_squared() > 0.0
-                        || !a.input.pressed.is_empty()
-                        || a.session.dirty
-                        || a.input.scroll.y != 0.0;
-                    if busy {
-                        a.session.dirty = false;
-                        if let Err(e) = a.tick_and_draw() {
-                            if matches!(e, wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) {
-                                let (w, h) = a.window.inner_size();
-                                a.gpu.resize(w.max(1), h.max(1));
-                            } else {
-                                eprintln!("render error: {e}");
-                                elwt.exit();
-                            }
-                        }
-                        a.window.request_redraw();
-                    }
-                }
-            }
-            winit::event::Event::RedrawRequested(_) => {
-                if let Some(a) = app.as_mut()
-                    && let Err(e) = a.tick_and_draw()
-                {
-                    eprintln!("render error: {e}");
-                    elwt.exit();
-                }
-            }
-            _ => {}
-        }
-    })?;
-    Ok(app.map(|a| format!("{:?}", a.gpu.adapter_info)))
+    let mut handler = Handler::default();
+    event_loop.run_app(&mut handler)?;
+    Ok(handler.app.map(|a| format!("{:?}", a.gpu.adapter_info)))
 }
 
-fn create_window(elwt: &winit::event_loop::ActiveEventLoop, app: &mut Option<App>) {
+/// Create the window and build the app around it.
+///
+/// Returns `false` if either step failed, having already asked the event loop to
+/// exit, so the caller does not have to.
+fn create_window(elwt: &winit::event_loop::ActiveEventLoop, slot: &mut Option<App>) -> bool {
     let attrs = winit::window::WindowAttributes::default()
         .with_title("CADKit")
         .with_inner_size(winit::dpi::LogicalSize::new(1600.0, 900.0))
         .with_min_inner_size(winit::dpi::LogicalSize::new(900.0, 600.0));
     let window = match elwt.create_window(attrs) {
-        Ok(w) => w,
+        Ok(w) => Arc::new(w),
         Err(e) => {
             eprintln!("could not create the window: {e}");
             elwt.exit();
-            return;
+            return false;
         }
     };
     match App::new(window) {
-        Ok(a) => {
+        Ok(mut app) => {
             // Frame the (empty) document so the grid and axes are visible.
-            let mut a = a;
-            a.session.viewport.cam2d.scale = 4.0;
-            *app = Some(a);
+            app.session.viewport.cam2d.scale = 4.0;
+            app.relayout();
+            *slot = Some(app);
+            true
         }
         Err(e) => {
             eprintln!("could not initialise the GPU: {e}");
             elwt.exit();
+            false
         }
     }
 }

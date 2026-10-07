@@ -8,7 +8,7 @@ use std::fmt;
 /// Everything that can go wrong during initialisation.
 #[derive(Debug)]
 pub enum GpuError {
-    NoAdapter,
+    NoAdapter(String),
     RequestDevice(wgpu::RequestDeviceError),
     CreateSurface(String),
     NoFormat,
@@ -18,7 +18,7 @@ pub enum GpuError {
 impl fmt::Display for GpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GpuError::NoAdapter => write!(f, "no suitable GPU adapter was found"),
+            GpuError::NoAdapter(m) => write!(f, "no suitable GPU adapter was found: {m}"),
             GpuError::RequestDevice(e) => write!(f, "could not create the GPU device: {e}"),
             GpuError::CreateSurface(m) => write!(f, "could not create the surface: {m}"),
             GpuError::NoFormat => write!(f, "the surface exposes no preferred texture format"),
@@ -28,6 +28,37 @@ impl fmt::Display for GpuError {
 }
 
 impl std::error::Error for GpuError {}
+
+/// Why a frame could not be presented.
+///
+/// wgpu 30 removed `SurfaceError` in favour of the `CurrentSurfaceTexture` enum,
+/// which distinguishes "retry later" (`Occluded`, `Timeout`) from "reconfigure"
+/// (`Outdated`) and "recreate" (`Lost`). Modelling the same three cases is what
+/// lets the caller's recovery logic be correct rather than best-effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameError {
+    /// The window was occluded or the frame timed out: skip and try again.
+    Skip,
+    /// The surface no longer matches the window: reconfigure and retry.
+    Outdated,
+    /// The surface was lost and must be recreated.
+    Lost,
+    /// A validation error escaped an error scope.
+    Invalid,
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FrameError::Skip => write!(f, "frame skipped (window occluded or timed out)"),
+            FrameError::Outdated => write!(f, "surface is outdated"),
+            FrameError::Lost => write!(f, "surface was lost"),
+            FrameError::Invalid => write!(f, "surface validation error"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
 
 /// Surface configuration, kept separate from the device so it can be recreated
 /// without leaking the device.
@@ -55,9 +86,6 @@ pub struct RenderTarget {
     pub view: [[f32; 4]; 4],
     pub projection: [[f32; 4]; 4],
     pub eye: [f32; 3],
-    /// Screen position of the view centre, used by the 3D line shader for its
-    /// rim light. Keeping it here avoids a second uniform buffer.
-    pub eye_screen: [f32; 2],
 }
 
 impl Default for RenderTarget {
@@ -66,7 +94,6 @@ impl Default for RenderTarget {
             view: Mat_identity(),
             projection: Mat_identity(),
             eye: [0.0, 0.0, 10.0],
-            eye_screen: [0.0, 0.0],
         }
     }
 }
@@ -89,13 +116,12 @@ impl RenderTarget {
             view: view.to_cols_array_2d(),
             projection: proj.to_cols_array_2d(),
             eye: cam.eye.to_array(),
-            eye_screen: [0.0, 0.0],
         }
     }
 
-    fn view_proj(&self) -> [[f32; 4]; 4] {
-        let vp = mul4(self.projection, self.view);
-        vp
+    /// Combined projection * view, in the column-major order the shaders expect.
+    pub fn view_proj(&self) -> [[f32; 4]; 4] {
+        mul4(self.projection, self.view)
     }
 }
 
@@ -197,20 +223,26 @@ impl Gpu {
         window: std::sync::Arc<wgpu::Window>,
         config: SurfaceConfig,
     ) -> Result<Self, GpuError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        // `InstanceDescriptor` has no `Default` impl and no `with_backends`, so start
+        // from its zero-config constructor and widen the backend set. Every
+        // backend enabled here is native; there is no web fallback.
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::all();
+        let instance = wgpu::Instance::new(desc);
+        // wgpu 30 infers `SurfaceTarget` from anything implementing
+        // `DisplayAndWindowHandle`, which `Arc<Window>` does via winit's
+        // `rwh_06` feature.
         let surface = instance
-            .create_surface(wgpu::SurfaceTarget::Window(Box::new(window)))
+            .create_surface(window)
             .map_err(|e| GpuError::CreateSurface(e.to_string()))?;
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
-        .ok_or(GpuError::NoAdapter)?;
+        .map_err(|e| GpuError::NoAdapter(e.to_string()))?;
 
         let adapter_info = adapter.get_info();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -218,6 +250,9 @@ impl Gpu {
             required_features: wgpu::Features::empty(),
             // No features: we only need core WebGPU, which keeps the binary small
             // and runs on every backend.
+            // downlevel_defaults() guarantees the limits work on every backend;
+            // using_resolution() widens only the texture dimensions, since the
+            // swapchain is the largest texture we will ever allocate.
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -240,10 +275,11 @@ impl Gpu {
                 format,
                 width: config.width.max(1),
                 height: config.height.max(1),
-                present_mode: wgpu::PresentMode::Fifo,
+                present_mode: wgpu::PresentMode::AutoVsync,
                 alpha_mode: caps.alpha_modes[0],
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
+                color_space: wgpu::SurfaceColorSpace::Auto,
             },
         );
 
@@ -277,19 +313,9 @@ impl Gpu {
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
-        self.surface.configure(
-            &self.device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format: self.format,
-                width: self.config.width,
-                height: self.config.height,
-                present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode: wgpu::CompositeAlphaMode::Auto,
-                view_formats: vec![],
-                desired_maximum_frame_latency: 2,
-            },
-        );
+        self.reconfigure();
+        // The MSAA and depth textures are sized to the old window; drop them and
+        // let `ensure_targets` recreate at the new size.
         self.color_msaa = None;
         self.depth = None;
         self.ensure_targets();
@@ -343,6 +369,10 @@ impl Gpu {
     }
 
     /// Update the per-frame uniform block.
+    ///
+    /// `resolution` is in *device* pixels: the shaders convert to NDC by dividing
+    /// by it, so passing CSS pixels there would make every quad the wrong size on
+    /// a HiDPI display.
     pub fn set_globals(
         &mut self,
         view_proj: [[f32; 4]; 4],
@@ -350,7 +380,7 @@ impl Gpu {
         zoom: f32,
         dpr: f32,
         time: f32,
-        eye_screen: [f32; 2],
+        eye: [f32; 2],
     ) {
         self.globals = Globals {
             view_proj,
@@ -359,7 +389,8 @@ impl Gpu {
             dpr,
             time,
             frame: self.stats.frame as f32,
-            pad: eye_screen,
+            eye,
+            _pad: [0.0, 0.0],
         };
         self.pipelines.update_globals(&self.queue, &self.globals);
     }
@@ -368,39 +399,58 @@ impl Gpu {
     ///
     /// Pass order (2D viewport on top of the 3D model view):
     /// 1. clear
-    /// 2. grid (depth-tested, no write)
-    /// 3. 3D solids (depth write)
-    /// 4. 3D lines (depth-tested, no write)
+    /// 2. 3D solids (depth write)
+    /// 3. 3D lines (depth-tested, no write)
+    /// 4. grid (depth-tested, no write)
     /// 5. 2D lines (screen space, no depth)
     /// 6. UI quads (screen space, no depth)
+    ///
+    /// `Skip` and `Outdated` are not failures: the caller should simply try
+    /// again, after reconfiguring the surface for the latter.
     pub fn render(
         &mut self,
         lines: &Batch2d,
         ui: &[UiVertex],
         solids: &Batch3d,
-    ) -> Result<(), wgpu::SurfaceError> {
+    ) -> Result<(), FrameError> {
         self.ensure_targets();
         self.stats.draw_calls = 0;
         self.stats.bytes_uploaded = 0;
 
+        // wgpu 30 models acquisition failure as a value, not a `Result`.
         let frame = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                // The window was resized or the surface was lost: reconfigure
-                // and skip this frame instead of crashing.
-                self.resize(self.config.width, self.config.height);
-                self.occluded = true;
-                return Ok(());
+            // `Suboptimal` means the swapchain no longer matches the window.
+            // Reconfigure now so the *next* frame is cheap, but still render this
+            // one: dropping it would make a resize stutter.
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                self.reconfigure();
+                t
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => {
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 self.occluded = true;
-                return Err(wgpu::SurfaceError::OutOfMemory);
+                return Err(FrameError::Skip);
             }
-            Err(e) => return Err(e),
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.reconfigure();
+                self.occluded = true;
+                return Err(FrameError::Outdated);
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.occluded = true;
+                return Err(FrameError::Lost);
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.occluded = true;
+                return Err(FrameError::Invalid);
+            }
         };
         self.occluded = false;
 
-        // --- upload ---
+        // --- upload -------------------------------------------------------
+        // `expand_lines` writes into a scratch buffer that is reused every frame,
+        // so a steady-state frame does no allocation at all.
+        let mut draw_calls = 0u32;
         let line_bytes = if lines.is_empty() {
             0
         } else {
@@ -409,6 +459,7 @@ impl Gpu {
             let n = self.line_buf.upload(&self.device, &self.queue, b);
             self.stats.line_vertices = n / std::mem::size_of::<LineQuadVertex>() as u64;
             self.stats.bytes_uploaded += n;
+            draw_calls += 1;
             n
         };
 
@@ -419,6 +470,7 @@ impl Gpu {
             let n = self.ui_buf.upload(&self.device, &self.queue, ui_bytes);
             self.stats.ui_vertices = n / std::mem::size_of::<UiVertex>() as u64;
             self.stats.bytes_uploaded += n;
+            draw_calls += 1;
             n
         };
 
@@ -429,6 +481,7 @@ impl Gpu {
             let n = self.solid_buf.upload(&self.device, &self.queue, b);
             self.stats.solid_vertices = n / std::mem::size_of::<SolidVertex>() as u64;
             self.stats.bytes_uploaded += n;
+            draw_calls += 1;
             n
         };
 
@@ -438,44 +491,40 @@ impl Gpu {
             let b = bytemuck::cast_slice(&solids.lines);
             let n = self.line3d_buf.upload(&self.device, &self.queue, b);
             self.stats.bytes_uploaded += n;
+            draw_calls += 1;
             n
         };
 
-        // --- record ---
+        // --- record -------------------------------------------------------
         let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let msaa = self.effective_msaa();
+
+        // Clone the view handles rather than borrowing `self`: the render pass
+        // below needs `&self.pipelines` and the buffers while the attachment
+        // descriptors are still alive, and holding a borrow across that would
+        // fight the `&mut self` draw-call accounting.
         let color_attachment = if msaa > 1 {
-            self.color_msaa.as_ref().unwrap()
+            self.color_msaa.clone()
         } else {
-            &surface_view
+            None
         };
+        let resolve = (msaa > 1).then(|| surface_view.clone());
+        let depth = self.depth.clone();
 
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-
         {
-            let color_attachment = color_attachment.clone();
-            let depth_attachment = self
-                .depth
-                .as_ref()
-                .map(|d| wgpu::RenderPassColorAttachment {
-                    view: d,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                });
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_attachment,
-                    resolve_target: if msaa > 1 { Some(&surface_view) } else { None },
+                    view: color_attachment.as_ref().unwrap_or(&surface_view),
+                    depth_slice: None,
+                    resolve_target: resolve.as_ref(),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.078,
@@ -486,9 +535,17 @@ impl Gpu {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: depth_attachment,
-                occlusion_query_set: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth.as_ref().ok_or(FrameError::Lost)?,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
@@ -497,33 +554,53 @@ impl Gpu {
                 pass.set_pipeline(&self.pipelines.solid);
                 pass.set_vertex_buffer(0, self.solid_buf.buffer.slice(..));
                 pass.draw(0..solid_count, 0..1);
-                self.stats.draw_calls += 1;
             }
             if line3d_count > 0 {
                 pass.set_pipeline(&self.pipelines.line3d);
                 pass.set_vertex_buffer(0, self.line3d_buf.buffer.slice(..));
                 pass.draw(0..line3d_count, 0..1);
-                self.stats.draw_calls += 1;
             }
             if line_bytes > 0 {
                 pass.set_pipeline(&self.pipelines.line_quad);
                 pass.set_vertex_buffer(0, self.line_buf.buffer.slice(..));
                 pass.draw(0..line_bytes, 0..1);
-                self.stats.draw_calls += 1;
             }
             if ui_count > 0 {
                 pass.set_pipeline(&self.pipelines.ui);
                 pass.set_vertex_buffer(0, self.ui_buf.buffer.slice(..));
                 pass.draw(0..ui_count, 0..1);
-                self.stats.draw_calls += 1;
             }
         }
 
+        self.stats.draw_calls = draw_calls;
         self.queue.submit(Some(enc.finish()));
-        frame.present();
+        // wgpu 30 presents through the queue, not the texture.
+        self.queue.present(frame);
         self.stats.frame += 1;
         self.stats.msaa_samples = msaa;
         Ok(())
+    }
+
+    /// Reconfigure the surface at its current size.
+    ///
+    /// Split out of [`Gpu::resize`] because a `Lost`/`Outdated` surface needs the
+    /// same treatment as a resize but must not go through the size bookkeeping.
+    fn reconfigure(&mut self) {
+        let size = self.config;
+        self.surface.configure(
+            &self.device,
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format: self.format,
+                width: size.width.max(1),
+                height: size.height.max(1),
+                present_mode: wgpu::PresentMode::AutoVsync,
+                alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                view_formats: vec![],
+                desired_maximum_frame_latency: 2,
+                color_space: wgpu::SurfaceColorSpace::Auto,
+            },
+        );
     }
 
     /// Bytes currently resident in the vertex buffers (for the debug overlay).
@@ -535,7 +612,10 @@ impl Gpu {
             + self.grid_buf.capacity
     }
 
-    /// Project a world point into screen pixels with the current globals.
+    /// Project a world point into *device* pixels with the current globals.
+    ///
+    /// Returns `None` for points at or behind the eye, where the perspective
+    /// divide would divide by ~0.
     pub fn project(&self, p: cad_core::Vec3) -> Option<cad_core::Vec2> {
         let vp = self.globals.view_proj;
         let clip = [
@@ -547,6 +627,7 @@ impl Gpu {
         if clip[3].abs() < 1e-9 {
             return None;
         }
+
         let ndc_x = clip[0] / clip[3];
         let ndc_y = clip[1] / clip[3];
         let (rx, ry) = (self.globals.resolution[0], self.globals.resolution[1]);
@@ -722,11 +803,32 @@ mod tests {
     #[test]
     fn errors_have_messages() {
         let msgs = [
-            GpuError::NoAdapter.to_string(),
+            GpuError::NoAdapter("no device".into()).to_string(),
             GpuError::NoFormat.to_string(),
             GpuError::Buffer("x".into()).to_string(),
         ];
         assert!(msgs.iter().all(|m| !m.is_empty()));
         assert!(msgs[0].contains("adapter"));
+        assert!(
+            msgs[0].contains("no device"),
+            "the reason must survive: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn frame_errors_are_distinguishable() {
+        // The caller recovers differently for each, so they must not collapse
+        // into one opaque variant.
+        assert_ne!(FrameError::Skip, FrameError::Outdated);
+        assert_ne!(FrameError::Outdated, FrameError::Lost);
+        for e in [
+            FrameError::Skip,
+            FrameError::Outdated,
+            FrameError::Lost,
+            FrameError::Invalid,
+        ] {
+            assert!(!e.to_string().is_empty(), "{e:?}");
+        }
     }
 }

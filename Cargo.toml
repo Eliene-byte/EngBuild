@@ -30,8 +30,26 @@ cad-gfx = { path = "crates/gfx" }
 cad-ui = { path = "crates/ui" }
 cad-app = { path = "crates/app" }
 
-wgpu = { version = "30.0", default-features = false, features = ["std", "wgsl", "dx12", "metal", "vulkan"] }
-winit = { version = "0.30", default-features = false }
+wgpu = { version = "30.0", default-features = false, features = [
+    "std",
+    "wgsl",
+    "dx12",
+    "metal",
+    "vulkan",
+] }
+
+# `rwh_06` is mandatory: wgpu 30 implements `SurfaceTarget` for anything that
+# provides a raw-window-handle 0.6 pair, and without it `create_surface` has no
+# safe entry point. `x11` + `wayland` are the two Linux backends; `wayland-dlopen`
+# lets the same binary run on either without linking libwayland at build time.
+# `wayland-csd-adwaita` is deliberately left out: it drags in a font stack we
+# do not use and would add a build-time system dependency.
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+] }
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "1.0"
 

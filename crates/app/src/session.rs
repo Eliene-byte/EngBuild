@@ -7,6 +7,7 @@ use crate::command::{CommandRegistry, CommandResult};
 use crate::tools::{Tool, ToolId, ToolOutcome, pick_window};
 use cad_core::{Camera2D, Camera3D, Rect2, Vec2, Vec3};
 use cad_doc::{Document, EntityId, History};
+use cad_gfx::renderer::RenderTarget;
 
 /// 2D drafting or 3D modelling view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +82,10 @@ pub struct Viewport {
     pub show_axes: bool,
     /// Rectangle occupied by the drawing area, excluding panels.
     pub canvas: Rect2,
+    /// 3D view target, refreshed by [`Viewport::refresh_target`]. Rebuilding it
+    /// every frame would allocate a `RenderTarget` per frame for no reason; the
+    /// shaders only need it when a 3D entity is actually drawn.
+    target: RenderTarget,
 }
 
 impl Default for Viewport {
@@ -93,11 +98,27 @@ impl Default for Viewport {
             grid_spacing: 10.0,
             show_axes: true,
             canvas: Rect2::from_xywh(0.0, 0.0, 1280.0, 720.0),
+            target: RenderTarget::default(),
         }
     }
 }
 
 impl Viewport {
+    /// The cached 3D view/projection pair the renderer uploads as globals.
+    pub fn target(&self) -> RenderTarget {
+        self.target
+    }
+
+    /// Rebuild the cached target after the camera or canvas changed.
+    pub fn refresh_target(&mut self) {
+        let aspect = if self.canvas.height() > 0.0 {
+            self.canvas.width() / self.canvas.height()
+        } else {
+            1.0
+        };
+        self.target = RenderTarget::from_camera(&self.cam3d, aspect);
+    }
+
     pub fn cam(&self) -> &Camera2D {
         &self.cam2d
     }
@@ -176,14 +197,16 @@ impl Session {
         self.dirty = true;
     }
 
+    /// Multiply the zoom by `factor`, keeping `focus` (screen pixels) fixed.
+    pub fn zoom_by_at(&mut self, factor: f32, focus: Vec2) {
+        self.viewport.cam2d.zoom_at(factor, focus);
+        self.dirty = true;
+    }
+
+    /// Multiply the zoom by `factor` about the canvas centre.
     pub fn zoom_by(&mut self, factor: f32) {
-        let focus = self
-            .viewport
-            .cam2d
-            .screen_to_world(self.viewport.canvas.center());
-        let screen = self.viewport.canvas.center();
-        self.viewport.cam2d.zoom_at(factor, screen);
-        let _ = focus;
+        let focus = self.viewport.canvas.center();
+        self.viewport.cam2d.zoom_at(factor, focus);
         self.dirty = true;
     }
 
@@ -408,7 +431,6 @@ impl Session {
                 self.doc.invalidate_extents();
                 self.dirty = true;
                 self.status = StatusMessage::success(format!("Erased {}", ids.len()));
-                let _ = ids;
             }
             ToolOutcome::ZoomTo(r) => self.zoom_to_rect(r),
             ToolOutcome::Restore => {
@@ -433,7 +455,10 @@ impl Session {
     pub fn finish_window(&mut self) {
         if let Some((a, b)) = self.window_drag.take() {
             let r = Rect2::new(a, b);
-            let crossing = self.viewport.cam().world_per_pixel() * 0.0 < 0.0; // left-to-right = window
+            // Direction decides the rule, as in every CAD app: left-to-right is a
+            // window selection (fully enclosed), right-to-left is a crossing
+            // selection (anything the rubber band touches).
+            let crossing = b.x < a.x;
             let ids = pick_window(&self.doc, r, !crossing);
             self.tool.selection = ids.clone();
             self.status = StatusMessage::info(format!("{} selected", ids.len()));

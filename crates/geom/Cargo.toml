@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "cad-geom"
 description = "Primitivas de curva, tesselacao e intersecoes robustas."
 version.workspace = true

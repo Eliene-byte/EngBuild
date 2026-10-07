@@ -5,11 +5,13 @@
 //! ~2k lines instead of a 2 MB framework, which is the whole point of this
 //! project.
 
+pub mod font;
 pub mod input;
 pub mod layout;
 pub mod theme;
 pub mod widgets;
 
+pub use font::measure as text_width;
 pub use input::{Event, Key, Modifiers, MouseButton};
 pub use layout::{Align, Layout, Padding, Rect, Size};
 pub use theme::Theme;

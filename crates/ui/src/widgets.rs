@@ -11,6 +11,9 @@ use crate::theme::Theme;
 use cad_core::{Rgba, Vec2};
 use cad_gfx::batch::{Batch2d, UiVertex, push_rect, push_rounded_rect};
 
+/// Cap height in pixels used by [`Ui::text`].
+pub const DEFAULT_TEXT_SIZE: f32 = 13.0;
+
 /// What a widget did this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Response {
@@ -216,9 +219,7 @@ impl<'a> Ui<'a> {
 
     pub fn stroke_rect(&mut self, r: Rect, color: Rgba, width: f32) {
         let h = width * 0.5;
-        let t = r.width().min(r.height()) * 0.5;
         // Four thin rects; cheaper and sharper than an SDF outline here.
-        let _ = t;
         push_rect(self.ui_batch, r.min.x, r.min.y, r.width(), h, color);
         push_rect(self.ui_batch, r.min.x, r.max.y - h, r.width(), h, color);
         push_rect(
@@ -239,10 +240,44 @@ impl<'a> Ui<'a> {
         );
     }
 
-    /// Text is emitted as geometry by the caller-supplied font shaper; here we
-    /// only reserve the space and record the request, which keeps `cad-ui`
-    /// independent of any font library.
-    pub fn text(&mut self, _s: &str, _pos: Vec2, _color: Rgba) {}
+    /// Width in pixels `s` would occupy at `size` (cap height).
+    pub fn text_width(&self, s: &str, size: f32) -> f32 {
+        crate::font::measure(s, size)
+    }
+
+    /// Draw `s` with its baseline box starting at `pos` (top-left, y down).
+    ///
+    /// Glyphs are stroked polylines pushed into the line batch, so this costs one
+    /// segment per font unit of stroke rather than a texture fetch. Returns the
+    /// advance so callers can lay out a row of labels.
+    pub fn text(&mut self, s: &str, pos: Vec2, color: Rgba) -> f32 {
+        self.text_sized(s, pos, color, DEFAULT_TEXT_SIZE)
+    }
+
+    /// [`Ui::text`] with an explicit cap height in pixels.
+    pub fn text_sized(&mut self, s: &str, pos: Vec2, color: Rgba, size: f32) -> f32 {
+        let unit = size / crate::font::UNITS_H;
+        let hairline = (size * 0.09).max(0.8);
+        let mut pen = pos;
+        for c in s.chars() {
+            let g = crate::font::glyph(c);
+            for stroke in g.strokes {
+                for pair in stroke.windows(2) {
+                    let a = Vec2::new(pos.x + pair[0].0 * unit, pos.y + pair[0].1 * unit);
+                    let b = Vec2::new(pos.x + pair[1].0 * unit, pos.y + pair[1].1 * unit);
+                    self.batch2d.segment(a, b, color, hairline);
+                }
+                // A single-point stroke is a dot; emit a degenerate-but-finite
+                // segment so punctuation still renders.
+                if stroke.len() == 1 {
+                    let a = Vec2::new(pos.x + stroke[0].0 * unit, pos.y + stroke[0].1 * unit);
+                    self.batch2d.segment(a, a, color, hairline);
+                }
+            }
+            pen.x += g.advance * unit;
+        }
+        pen.x - pos.x
+    }
 
     /// Request a tooltip for `r`.
     pub fn tooltip(&mut self, r: Rect, text: &str) {
