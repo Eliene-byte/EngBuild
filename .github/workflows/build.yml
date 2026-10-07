@@ -78,11 +78,13 @@ jobs:
               # One annotation per log line: a cargo-level failure (manifest,
               # lockfile, rustup component, disk) otherwise shows up here as a
               # bare exit code with nothing to go on.
+              # Take the tail: the interesting part is the end. The start is
+              # hundreds of "Downloading"/"Checking" lines that tell us nothing.
               n=0
               while IFS= read -r line && [ "$n" -lt 40 ]; do
                 echo "::error title=clippy-log::$line"
                 n=$((n + 1))
-              done < clippy.log
+              done < <(tail -n 40 clippy.log)
             fi
           fi
           exit "$status"
