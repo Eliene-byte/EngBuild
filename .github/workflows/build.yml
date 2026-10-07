@@ -87,11 +87,15 @@ jobs:
               # bare exit code with nothing to go on.
               # Take the tail: the interesting part is the end. The start is
               # hundreds of "Downloading"/"Checking" lines that tell us nothing.
+              # Uploaded logs are only downloadable with a token, so the log has to
+              # travel through annotations to be readable at all. Strip the
+              # control characters cargo emits so each one is a single line.
               n=0
-              while IFS= read -r line && [ "$n" -lt 40 ]; do
-                echo "::error title=clippy-log::$line"
+              while IFS= read -r line && [ "$n" -lt 60 ]; do
+                clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
+                echo "::error title=clippy-log::$clean"
                 n=$((n + 1))
-              done < <(tail -n 40 clippy.log)
+              done < <(tail -n 60 clippy.log)
             fi
           fi
           exit "$status"
