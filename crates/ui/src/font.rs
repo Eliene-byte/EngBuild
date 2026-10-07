@@ -442,7 +442,7 @@ mod tests {
         // nothing should fly off to infinity, which would mean a typo in the table.
         for c in ('A'..='Z').chain('0'..='9').chain(['_', ',', '|', '~']) {
             for stroke in glyph(c).strokes {
-                for &(x, y) in stroke {
+                for &(x, y) in *stroke {
                     assert!(x.is_finite() && y.is_finite(), "{c}: ({x},{y})");
                     assert!((-1.0..=5.0).contains(&x), "{c}: x={x} out of range");
                     assert!((-1.0..=8.0).contains(&y), "{c}: y={y} out of range");

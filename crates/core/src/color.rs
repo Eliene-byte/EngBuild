@@ -134,15 +134,15 @@ impl From<Rgba> for Srgba {
 /// The classic AutoCAD-ish 7-color ACI palette (first 10 indices), kept because
 /// DXF files reference colors by index.
 pub const ACI_PALETTE: [u32; 9] = [
-    0xFFFF_0000,  // 1 red
-    0xFFFF_FF00,  // 2 yellow
-    0xFF00_FF00,  // 3 green
-    0xFF00_FFFF,  // 4 cyan
-    0xFF00_00FF,  // 5 blue
-    0xFFFF_00FF,  // 6 magenta
-    0xFF00_0000,  // 7 white/black (by layer)
-    0xFF80_80_80, // 8 dark gray
-    0xFFC0_C0C0,  // 9 light gray
+    0xFFFF_0000,   // 1 red
+    0xFFFF_FF00,   // 2 yellow
+    0xFF00_FF00,   // 3 green
+    0xFF00_FFFF,   // 4 cyan
+    0xFF00_00FF,   // 5 blue
+    0xFFFF_00FF,   // 6 magenta
+    0xFF00_0000,   // 7 white/black (by layer)
+    0xFF_80_80_80, // 8 dark gray
+    0xFF_C0_C0_C0, // 9 light gray
 ];
 
 /// Resolve an ACI color index to RGBA. `0` means "by block", `256` "by layer",

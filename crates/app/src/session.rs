@@ -75,7 +75,7 @@ impl StatusMessage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Viewport {
     pub cam2d: Camera2D,
-    pub cam3d: Camera3d,
+    pub cam3d: Camera3D,
     pub mode: ViewMode,
     pub show_grid: bool,
     pub grid_spacing: f32,
@@ -92,7 +92,7 @@ impl Default for Viewport {
     fn default() -> Self {
         Self {
             cam2d: Camera2D::default(),
-            cam3d: Camera3d::default(),
+            cam3d: Camera3D::default(),
             mode: ViewMode::Model2d,
             show_grid: true,
             grid_spacing: 10.0,
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn activate_sets_the_tool_and_prompt() {
         let mut s = Session::new();
-        s.activate("line").ok();
+        assert!(s.activate("line").is_ok());
         assert_eq!(s.tool.id, ToolId::Line);
         assert_eq!(
             s.tool.prompt().as_deref(),
@@ -692,7 +692,7 @@ mod tests {
     fn clicking_draws_and_marks_dirty() {
         let mut s = Session::new();
         s.viewport.cam2d = Camera2D::new(Vec2::new(800.0, 600.0));
-        s.activate("line").ok();
+        assert!(s.activate("line").is_ok());
         s.dirty = false;
         s.click_world(Vec2::ZERO, false);
         assert!(s.dirty);
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn a_second_entity_is_counted() {
-        let mut s = session_with_line_and_circle();
+        let s = session_with_line_and_circle();
         assert_eq!(s.doc.entities.len(), 2);
         assert_eq!(s.entity_summary(), (2, 0));
     }
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn sticky_prompts_survive_ticks() {
         let mut s = Session::new();
-        s.activate("circle").ok();
+        assert!(s.activate("circle").is_ok());
         s.status = StatusMessage::prompt("Specify centre point");
         s.tick(100.0);
         assert_eq!(s.status.text, "Specify centre point");

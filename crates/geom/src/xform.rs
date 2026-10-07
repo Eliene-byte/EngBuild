@@ -399,7 +399,8 @@ mod tests {
 
     #[test]
     fn rect_transform_covers_corners() {
-        let t = Affine2::rotation(0.785398);
+        // pi/4: a 45-degree rotation turns a unit square into one of side sqrt(2).
+        let t = Affine2::rotation(cad_core::FRAC_PI_4);
         let r = Rect2::from_xywh(0.0, 0.0, 1.0, 1.0);
         let o = t.apply_rect(r);
         let expect = 2f32.sqrt();

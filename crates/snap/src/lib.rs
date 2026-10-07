@@ -383,12 +383,12 @@ impl SnapEngine {
 
         if self.settings.has(SnapKind::Ortho) {
             for a in &self.settings.ortho_angles {
-                if let Some(delta) = angle_delta_to(angle, *a) {
-                    if delta.abs() < 0.0873 {
-                        // ~5 degrees of slack, as AutoCAD uses.
-                        angle = *a;
-                        break;
-                    }
+                // ~5 degrees of slack, as AutoCAD uses.
+                if let Some(delta) = angle_delta_to(angle, *a)
+                    && delta.abs() < 0.0873
+                {
+                    angle = *a;
+                    break;
                 }
             }
         }
@@ -746,10 +746,8 @@ fn push_entity_points(e: &Entity, engine: &SnapEngine, out: &mut Vec<Candidate>,
                 out.push(Candidate::new(p.position.xy(), SnapKind::Node, Some(id)));
             }
         }
-        EntityKind::Insert(i) => {
-            if s.has(SnapKind::Insert) {
-                out.push(Candidate::new(i.position.xy(), SnapKind::Insert, Some(id)));
-            }
+        EntityKind::Insert(i) if s.has(SnapKind::Insert) => {
+            out.push(Candidate::new(i.position.xy(), SnapKind::Insert, Some(id)));
         }
         _ => {}
     }

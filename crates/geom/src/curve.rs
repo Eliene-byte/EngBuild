@@ -518,8 +518,8 @@ impl Polyline {
         vertices.reverse();
         let mut bulges = vec![Bulge::NONE; n];
         if n > 1 {
-            for i in 0..n.saturating_sub(1) {
-                bulges[i] = Bulge(-self.bulge_at(n - 2 - i).0);
+            for (i, slot) in bulges.iter_mut().enumerate().take(n - 1) {
+                *slot = Bulge(-self.bulge_at(n - 2 - i).0);
             }
         }
         if self.closed {

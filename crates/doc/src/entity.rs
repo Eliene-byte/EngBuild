@@ -56,7 +56,15 @@ impl Box3d {
     }
 }
 
+/// Indices per triangle. Named so the mesh code reads in terms of triangles
+/// rather than the magic 3.
+const TRI: usize = 3;
+
 /// A triangle mesh in world space: positions + optional per-vertex normals.
+///
+/// `indices` is a triangle list: three consecutive indices per triangle. A
+/// trailing partial triangle is ignored rather than treated as an error, since a
+/// half-written mesh from a crashed exporter is better dropped than fatal.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Mesh3d {
     pub positions: Vec<Vec3>,
@@ -66,7 +74,7 @@ pub struct Mesh3d {
 
 impl Mesh3d {
     pub fn triangle_count(&self) -> usize {
-        self.indices.len() / 3
+        self.indices.len() / TRI
     }
     pub fn bounds(&self) -> Aabb3 {
         let mut b = Aabb3::ZERO;
@@ -84,8 +92,12 @@ impl Mesh3d {
     /// Recompute smooth vertex normals by area-weighted averaging.
     pub fn recompute_normals(&mut self) {
         let mut n = vec![Vec3::ZERO; self.positions.len()];
-        for tri in self.indices.chunks_exact(3) {
-            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        // Iterate by triangle index rather than by slicing: `TRI` is a named
+        // constant, and a slice pattern would hard-code the same 3 twice.
+        for t in 0..self.triangle_count() {
+            let i0 = self.indices[t * TRI] as usize;
+            let i1 = self.indices[t * TRI + 1] as usize;
+            let i2 = self.indices[t * TRI + 2] as usize;
             let (p0, p1, p2) = (self.positions[i0], self.positions[i1], self.positions[i2]);
             // Un-normalised cross product is area-weighted, which is what we want.
             let fn_ = (p1 - p0).cross(p2 - p0);

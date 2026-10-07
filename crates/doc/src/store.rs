@@ -106,10 +106,10 @@ impl SpatialIndex {
                 }
             }
         }
-        if !found {
-            if let Some(p) = self.overflow.iter().position(|v| *v == id) {
-                self.overflow.swap_remove(p);
-            }
+        // `found` is false when the id was only in the overflow list, so this is
+        // the one place that list is pruned.
+        if !found && let Some(p) = self.overflow.iter().position(|v| *v == id) {
+            self.overflow.swap_remove(p);
         }
     }
 
@@ -127,10 +127,10 @@ impl SpatialIndex {
         // Entities parked outside the grid are still candidates, but only when
         // their real bounds overlap the query.
         for id in &self.overflow {
-            if let Some(b) = self.placed.get(id.index()) {
-                if b.overlaps(r) {
-                    out.push(*id);
-                }
+            if let Some(b) = self.placed.get(id.index())
+                && b.overlaps(r)
+            {
+                out.push(*id);
             }
         }
         out.sort_unstable();
@@ -228,10 +228,12 @@ impl EntityStore {
 
     pub fn remove(&mut self, id: EntityId) -> Option<Entity> {
         let old = self.slab.get_mut(id.index())?.take()?;
-        if let Some(r) = self.index.placed.get(id.index()).copied() {
-            if !r.is_empty() {
-                self.index.remove_id(id, r);
-            }
+        // An empty old rect means the entity was never indexed, so there is
+        // nothing to un-bucket.
+        if let Some(r) = self.index.placed.get(id.index()).copied()
+            && !r.is_empty()
+        {
+            self.index.remove_id(id, r);
         }
         self.free.push(id);
         self.revision = self.revision.wrapping_add(1);
@@ -243,10 +245,10 @@ impl EntityStore {
         if self.slab.get(id.index()).and_then(|o| o.as_ref()).is_none() {
             return false;
         }
-        if let Some(old) = self.index.placed.get(id.index()).copied() {
-            if !old.is_empty() {
-                self.index.remove_id(id, old);
-            }
+        if let Some(old) = self.index.placed.get(id.index()).copied()
+            && !old.is_empty()
+        {
+            self.index.remove_id(id, old);
         }
         let bounds = e.index_bounds();
         self.slab[id.index()] = Some(e);
@@ -266,10 +268,10 @@ impl EntityStore {
         }
         if self.slab[id.index()].is_some() {
             self.slab[id.index()] = Some(e);
-            if let Some(old) = self.index.placed.get(id.index()).copied() {
-                if !old.is_empty() {
-                    self.index.remove_id(id, old);
-                }
+            if let Some(old) = self.index.placed.get(id.index()).copied()
+                && !old.is_empty()
+            {
+                self.index.remove_id(id, old);
             }
             self.index.insert_id(id, bounds);
         } else {

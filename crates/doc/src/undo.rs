@@ -74,11 +74,9 @@ impl Change {
                 (None, Some(Some(_))) => created += 1,
                 // Prior image and none now: the entity was deleted.
                 (Some(_), Some(None)) => deleted += 1,
-                (Some(x), Some(Some(y))) => {
-                    if x != y {
-                        modified += 1;
-                    }
-                }
+                // Same slot both before and after: only counts as a
+                // modification if the image actually differs.
+                (Some(x), Some(Some(y))) if x != y => modified += 1,
                 _ => {}
             }
         }
@@ -327,15 +325,17 @@ impl<'a> Txn<'a> {
         layers: Option<&crate::layer::LayerTable>,
         blocks: Option<&crate::block::BlockTable>,
     ) {
-        if self.layers_before.is_some() {
-            if let Some(l) = layers {
-                self.layers_after = Some(LayerSnap::of(l));
-            }
+        // Only snapshot a table that was itself snapshotted at `begin`; an
+        // "after" image without a "before" would make the entry un-rewindable.
+        if self.layers_before.is_some()
+            && let Some(l) = layers
+        {
+            self.layers_after = Some(LayerSnap::of(l));
         }
-        if self.blocks_before.is_some() {
-            if let Some(b) = blocks {
-                self.blocks_after = Some(BlockSnap::of(b));
-            }
+        if self.blocks_before.is_some()
+            && let Some(b) = blocks
+        {
+            self.blocks_after = Some(BlockSnap::of(b));
         }
     }
 

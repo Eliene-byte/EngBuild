@@ -1,9 +1,11 @@
 //! Frame orchestration: surface, depth/MSAA targets, pass order, and the
 //! buffers that back the pipelines.
 
-use crate::batch::{Batch2d, Batch3d, LineVertex, SolidVertex, UiVertex};
-use crate::pipeline::{Globals, LineQuadVertex, PipelineSet, expand_lines};
+use crate::batch::{Batch2d, Batch3d, LineVertex3d, SolidVertex, UiVertex};
+use crate::pipeline::LineQuadVertex;
+use crate::pipeline::{Globals, PipelineSet, expand_lines};
 use std::fmt;
+use std::mem::size_of;
 
 /// Everything that can go wrong during initialisation.
 #[derive(Debug)]
@@ -91,14 +93,14 @@ pub struct RenderTarget {
 impl Default for RenderTarget {
     fn default() -> Self {
         Self {
-            view: Mat_identity(),
-            projection: Mat_identity(),
+            view: identity_mat4(),
+            projection: identity_mat4(),
             eye: [0.0, 0.0, 10.0],
         }
     }
 }
 
-const fn Mat_identity() -> [[f32; 4]; 4] {
+const fn identity_mat4() -> [[f32; 4]; 4] {
     [
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],
@@ -161,9 +163,18 @@ impl VertexBuffer {
             label,
         }
     }
-    /// Upload `data`, reallocating if needed. Returns the draw vertex count.
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8]) -> u64 {
-        let need = data.len().max(16) as u64;
+    /// Upload `data`, reallocating if needed.
+    ///
+    /// Returns the element count of `T`, not a byte count: every caller wants a
+    /// vertex count for `draw`, and returning bytes is the kind of unit confusion
+    /// that only shows up as garbled geometry. `T` is bounded to `NoUninit` rather
+    /// than `Pod` because a buffer's spare capacity need not be readable.
+    fn upload<T>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[T]) -> u64
+    where
+        T: bytemuck::NoUninit,
+    {
+        let bytes = bytemuck::cast_slice::<T, u8>(data);
+        let need = bytes.len().max(16) as u64;
         if need > self.capacity {
             // Over-allocate so a growing frame does not realloc every frame.
             let next = need.next_power_of_two().max(1024);
@@ -175,8 +186,8 @@ impl VertexBuffer {
             });
             self.capacity = next;
         }
-        if !data.is_empty() {
-            queue.write_buffer(&self.buffer, 0, data);
+        if !bytes.is_empty() {
+            queue.write_buffer(&self.buffer, 0, bytes);
         }
         data.len() as u64
     }
@@ -219,10 +230,15 @@ pub struct Gpu {
 
 impl Gpu {
     /// Create a renderer for `window`.
-    pub fn new(
-        window: std::sync::Arc<wgpu::Window>,
-        config: SurfaceConfig,
-    ) -> Result<Self, GpuError> {
+    ///
+    /// Generic over the window-handle type so this crate stays free of a winit
+    /// dependency: any `DisplayAndWindowHandle` works, which is exactly what
+    /// `wgpu::Instance::create_surface` requires. `Arc<winit::window::Window>`
+    /// qualifies via winit's `rwh_06` feature.
+    pub fn new<W>(window: W, config: SurfaceConfig) -> Result<Self, GpuError>
+    where
+        W: wgpu::DisplayAndWindowHandle + 'static,
+    {
         // `InstanceDescriptor` has no `Default` impl and no `with_backends`, so start
         // from its zero-config constructor and widen the backend set. Every
         // backend enabled here is native; there is no web fallback.
@@ -448,49 +464,56 @@ impl Gpu {
         self.occluded = false;
 
         // --- upload -------------------------------------------------------
-        // `expand_lines` writes into a scratch buffer that is reused every frame,
-        // so a steady-state frame does no allocation at all.
+        // `expand_lines` writes into a scratch buffer reused every frame, so a
+        // steady-state frame allocates nothing.
+        //
+        // Each count below is a *vertex* count, which is what `draw` wants. The
+        // byte count is derived once per buffer for the stats overlay rather
+        // than tracked separately, so the two can never drift apart.
         let mut draw_calls = 0u32;
-        let line_bytes = if lines.is_empty() {
+
+        let line_verts = if lines.is_empty() {
             0
         } else {
             expand_lines(&lines.lines, &mut self.scratch_lines);
-            let b = bytemuck::cast_slice(&self.scratch_lines);
-            let n = self.line_buf.upload(&self.device, &self.queue, b);
-            self.stats.line_vertices = n / std::mem::size_of::<LineQuadVertex>() as u64;
-            self.stats.bytes_uploaded += n;
+            let n = self
+                .line_buf
+                .upload(&self.device, &self.queue, &self.scratch_lines);
+            self.stats.line_vertices = n;
+            self.stats.bytes_uploaded += n * size_of::<LineQuadVertex>() as u64;
             draw_calls += 1;
             n
         };
 
-        let ui_bytes = bytemuck::cast_slice(ui);
-        let ui_count = if ui.is_empty() {
+        let ui_verts = if ui.is_empty() {
             0
         } else {
-            let n = self.ui_buf.upload(&self.device, &self.queue, ui_bytes);
-            self.stats.ui_vertices = n / std::mem::size_of::<UiVertex>() as u64;
-            self.stats.bytes_uploaded += n;
+            let n = self.ui_buf.upload(&self.device, &self.queue, ui);
+            self.stats.ui_vertices = n;
+            self.stats.bytes_uploaded += n * size_of::<UiVertex>() as u64;
             draw_calls += 1;
             n
         };
 
-        let solid_count = if solids.solids.is_empty() {
+        let solid_verts = if solids.solids.is_empty() {
             0
         } else {
-            let b = bytemuck::cast_slice(&solids.solids);
-            let n = self.solid_buf.upload(&self.device, &self.queue, b);
-            self.stats.solid_vertices = n / std::mem::size_of::<SolidVertex>() as u64;
-            self.stats.bytes_uploaded += n;
+            let n = self
+                .solid_buf
+                .upload(&self.device, &self.queue, &solids.solids);
+            self.stats.solid_vertices = n;
+            self.stats.bytes_uploaded += n * size_of::<SolidVertex>() as u64;
             draw_calls += 1;
             n
         };
 
-        let line3d_count = if solids.lines.is_empty() {
+        let line3d_verts = if solids.lines.is_empty() {
             0
         } else {
-            let b = bytemuck::cast_slice(&solids.lines);
-            let n = self.line3d_buf.upload(&self.device, &self.queue, b);
-            self.stats.bytes_uploaded += n;
+            let n = self
+                .line3d_buf
+                .upload(&self.device, &self.queue, &solids.lines);
+            self.stats.bytes_uploaded += n * size_of::<LineVertex3d>() as u64;
             draw_calls += 1;
             n
         };
@@ -550,25 +573,25 @@ impl Gpu {
 
             pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
 
-            if solid_count > 0 {
+            if solid_verts > 0 {
                 pass.set_pipeline(&self.pipelines.solid);
                 pass.set_vertex_buffer(0, self.solid_buf.buffer.slice(..));
-                pass.draw(0..solid_count, 0..1);
+                pass.draw(0..solid_verts as u32, 0..1);
             }
-            if line3d_count > 0 {
+            if line3d_verts > 0 {
                 pass.set_pipeline(&self.pipelines.line3d);
                 pass.set_vertex_buffer(0, self.line3d_buf.buffer.slice(..));
-                pass.draw(0..line3d_count, 0..1);
+                pass.draw(0..line3d_verts as u32, 0..1);
             }
-            if line_bytes > 0 {
+            if line_verts > 0 {
                 pass.set_pipeline(&self.pipelines.line_quad);
                 pass.set_vertex_buffer(0, self.line_buf.buffer.slice(..));
-                pass.draw(0..line_bytes, 0..1);
+                pass.draw(0..line_verts as u32, 0..1);
             }
-            if ui_count > 0 {
+            if ui_verts > 0 {
                 pass.set_pipeline(&self.pipelines.ui);
                 pass.set_vertex_buffer(0, self.ui_buf.buffer.slice(..));
-                pass.draw(0..ui_count, 0..1);
+                pass.draw(0..ui_verts as u32, 0..1);
             }
         }
 
@@ -687,27 +710,33 @@ fn invert4(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
             return m;
         }
         a.swap(col, piv);
+        // Normalise the pivot row, then clear the pivot column from the others.
         let d = a[col][col];
-        for c in 0..8 {
-            a[col][c] /= d;
+        for v in a[col].iter_mut() {
+            *v /= d;
         }
-        for r in 0..4 {
+        // Read the pivot row out first: it is borrowed immutably inside the loop
+        // that mutably borrows `a`, and splitting that borrow needs a copy.
+        let pivot = a[col];
+        for (r, row) in a.iter_mut().enumerate() {
             if r == col {
                 continue;
             }
-            let f = a[r][col];
+            let f = row[col];
             if f == 0.0 {
                 continue;
             }
-            for c in 0..8 {
-                a[r][c] -= f * a[col][c];
+            for (c, v) in row.iter_mut().enumerate() {
+                *v -= f * pivot[c];
             }
         }
     }
+    // `a` holds the solution on the right; transpose the left 4x4 block back
+    // into column-major order.
     let mut out = [[0.0f32; 4]; 4];
-    for r in 0..4 {
-        for c in 0..4 {
-            out[c][r] = a[r][4 + c];
+    for (r, row) in a.iter().enumerate() {
+        for (c, v) in row.iter().skip(4).enumerate() {
+            out[c][r] = *v;
         }
     }
     out
@@ -716,11 +745,11 @@ fn invert4(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cad_core::{Camera3D, Vec2, Vec3};
+    use cad_core::{Camera3D, Vec3};
 
     #[test]
     fn mat4_multiply_is_column_major() {
-        let id = Mat_identity();
+        let id = identity_mat4();
         assert_eq!(mul4(id, id), id);
         let scale = [
             [2.0, 0.0, 0.0, 0.0],
@@ -744,14 +773,10 @@ mod tests {
         ];
         let i = invert4(m);
         let r = mul4(m, i);
-        for c in 0..4 {
-            for row in 0..4 {
+        for (c, col) in r.iter().enumerate() {
+            for (row, v) in col.iter().enumerate() {
                 let expect = if c == row { 1.0 } else { 0.0 };
-                assert!(
-                    (r[c][row] - expect).abs() < 1e-5,
-                    "col {c} row {row} = {}",
-                    r[c][row]
-                );
+                assert!((v - expect).abs() < 1e-5, "col {c} row {row} = {v}");
             }
         }
     }

@@ -115,10 +115,11 @@ impl BlockTable {
         self.len() == 0
     }
     pub fn iter(&self) -> impl Iterator<Item = (BlockId, &Block)> {
+        // Slots are sparse (an id is reused after an erase), so skip the empties
+        // rather than reporting their indices as block ids.
         self.items
             .iter()
-            .enumerate()
-            .filter_map(|(_, o)| o.as_ref().map(|r| (r.id, &r.block)))
+            .filter_map(|o| o.as_ref().map(|r| (r.id, &r.block)))
     }
 
     /// Add an entity to a block definition.

@@ -349,9 +349,13 @@ mod tests {
         cam.zoom_step(1);
         let l = cam.scale.log10();
         let frac = l - l.floor();
+        // `zoom_step` walks a 1-2-5 style ladder, so the decade position of
+        // log10(scale) should be a "nice" number. Check it against the exact
+        // fractions rather than rounded literals.
+        const NICE: [f32; 4] = [0.0, 1.0 / 3.0, 1.0 / 2.0, 7.0 / 15.0];
         assert!(
-            frac < 1e-4 || (frac - 0.30103).abs() < 1e-3 || (frac - 0.47712).abs() < 1e-3,
-            "scale={} log={l}",
+            NICE.iter().any(|n| (frac - n).abs() < 1e-3),
+            "scale={} log={l} frac={frac}",
             cam.scale
         );
     }

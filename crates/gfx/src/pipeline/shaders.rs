@@ -20,6 +20,43 @@
 /// ```
 pub const GLOBALS_SIZE: u64 = 96;
 
+/// Prepend the shared uniform block to a per-shader body.
+///
+/// `concat!` cannot take a path to a `const`, so composition happens at runtime.
+/// These run exactly once per pipeline at startup; the returned `String` is
+/// borrowed by the `ShaderModule` only for the duration of the call.
+fn with_globals(body: &str) -> String {
+    let mut s = String::with_capacity(WGSL_GLOBALS.len() + body.len());
+    s.push_str(WGSL_GLOBALS);
+    s.push_str(body);
+    s
+}
+
+/// Complete WGSL source for the 2D line pipeline.
+pub fn line_quad_2d() -> String {
+    with_globals(WGSL_LINE_QUAD_2D)
+}
+
+/// Complete WGSL source for the UI pipeline.
+pub fn ui() -> String {
+    with_globals(WGSL_UI)
+}
+
+/// Complete WGSL source for the 3D solid pipeline.
+pub fn solid_3d() -> String {
+    with_globals(WGSL_SOLID_3D)
+}
+
+/// Complete WGSL source for the 3D line pipeline.
+pub fn line_3d() -> String {
+    with_globals(WGSL_LINE_3D)
+}
+
+/// Complete WGSL source for the 3D grid pipeline.
+pub fn grid_3d() -> String {
+    with_globals(WGSL_GRID_3D)
+}
+
 /// Global uniform block, mirrored in Rust by [`super::pipeline::Globals`].
 pub const WGSL_GLOBALS: &str = r#"
 struct Globals {

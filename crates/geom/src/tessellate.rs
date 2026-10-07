@@ -141,8 +141,11 @@ pub fn ellipse_to_beziers(e: Ellipse) -> [Bezier; 4] {
     let k = 4.0 / 3.0 * ((TWO_PI / 4.0) * 0.25).tan();
     let (u, v) = (e.major_dir(), e.minor_dir());
     let (a, b) = (e.semi_major(), e.semi_minor());
+    // Four quarter sweeps, joined end to end. Each is the standard cubic
+    // approximation of a circular arc: the control-point length is
+    // k = 4/3 * tan(Delta/4) times the radius.
     let mut out = [Bezier::new(e.center, e.center, e.center, e.center); 4];
-    for i in 0..4 {
+    for (i, slot) in out.iter_mut().enumerate() {
         let t0 = TWO_PI * i as f32 / 4.0;
         let t1 = TWO_PI * (i as f32 + 1.0) / 4.0;
         let (s0, c0) = t0.sin_cos();
@@ -151,7 +154,7 @@ pub fn ellipse_to_beziers(e: Ellipse) -> [Bezier; 4] {
         let p3 = e.center + u * (c1 * a) + v * (s1 * b);
         let d0 = u * (-s0 * a) + v * (c0 * b);
         let d1 = u * (-s1 * a) + v * (c1 * b);
-        out[i] = Bezier::new(p0, p0 + d0 * k, p3 - d1 * k, p3);
+        *slot = Bezier::new(p0, p0 + d0 * k, p3 - d1 * k, p3);
     }
     out
 }
@@ -265,10 +268,12 @@ mod tests {
             opts,
         );
         let mut worst: f32 = 0.0;
-        for i in 1..pts.len().saturating_sub(1) {
+        // Skip the first and last point: they are exact by construction, and the
+        // first/last are the same point on a closed circle.
+        for p in pts.iter().skip(1).take(pts.len().saturating_sub(2)) {
             // distance from the exact circle at this angle
-            let exact = Vec2::ZERO + pts[i].normalize_or(Vec2::X) * radius;
-            worst = worst.max(exact.distance(pts[i]));
+            let exact = Vec2::ZERO + p.normalize_or(Vec2::X) * radius;
+            worst = worst.max(exact.distance(*p));
         }
         // also measure against the chord midpoints
         for w in pts.windows(2) {

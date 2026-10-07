@@ -569,10 +569,12 @@ fn parse_geometry(
                         pending_x = Some(p.f32());
                     }
                     20 => {
-                        if let Some(x) = pending_x.take() {
-                            if let Some(v) = verts.last_mut() {
-                                *v = Vec2::new(x, p.f32());
-                            }
+                        // Group 20 is Y; 10 (X) may have arrived first or not at
+                        // all, in which case there is no vertex to complete.
+                        if let Some(x) = pending_x.take()
+                            && let Some(v) = verts.last_mut()
+                        {
+                            *v = Vec2::new(x, p.f32());
                         }
                     }
                     42 => {
@@ -690,10 +692,8 @@ fn parse_geometry(
             let bid = blocks
                 .get(&name.to_ascii_uppercase())
                 .copied()
-                .unwrap_or_else(|| {
-                    // Unknown block: keep the reference so nothing is silently lost.
-                    cad_doc::handle::BlockId(u32::MAX)
-                });
+                // Unknown block: keep the reference so nothing is silently lost.
+                .unwrap_or(cad_doc::handle::BlockId(u32::MAX));
             Some(EntityKind::Insert(InsertRef {
                 block: bid,
                 position: pos,

@@ -152,7 +152,7 @@ impl CommandRegistry {
         self.commands
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.menu.first() == Some(top))
+            .filter(|(_, c)| c.menu.first() == Some(&top))
             .map(|(i, _)| i)
             .collect()
     }

@@ -1,6 +1,6 @@
 //! Rectangles, sizing and the layout cursor.
 
-use cad_core::{Rect2, Vec2};
+use cad_core::Vec2;
 
 pub use cad_core::Rect2 as Rect;
 

@@ -10,13 +10,17 @@ use crate::batch::{LineVertex, LineVertex3d, SolidVertex, UiVertex};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-/// Mirrors `Globals` in `shaders.rs`. Must stay 96 bytes and 16-byte aligned.
+/// Mirrors `Globals` in `shaders.rs`. Must stay 96 bytes.
 ///
-/// `#[repr(C)]` plus explicit padding is what keeps this byte-compatible with
-/// the WGSL `struct Globals`: `bytemuck` refuses the derive outright if the two
-/// ever disagree, which is the failure mode we want.
+/// `#[repr(C)]` plus explicit padding is what keeps this byte-compatible with the
+/// WGSL `struct Globals`, and `bytemuck` refuses the `Pod` derive outright if the
+/// two ever disagree — which is the failure mode we want.
+///
+/// Note there is deliberately no `align(16)` here: it would insert 8 bytes of
+/// implicit padding that `Pod` rejects. A wgpu uniform buffer only needs its
+/// *size* to be a multiple of 16, which the explicit fields already give.
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-#[repr(C, align(16))]
+#[repr(C)]
 pub struct Globals {
     pub view_proj: [[f32; 4]; 4],
     pub resolution: [f32; 2],
@@ -27,6 +31,7 @@ pub struct Globals {
     /// World-space eye position (x, y). The 3D shaders use it for the rim light
     /// and the grid's distance fade.
     pub eye: [f32; 2],
+    /// Explicit padding to 96 bytes.
     pub _pad: [f32; 2],
 }
 
@@ -169,15 +174,6 @@ pub fn color_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
     }
 }
 
-/// Blend state for opaque 3D solids: no blending, but alpha must still write.
-fn opaque_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
-    wgpu::ColorTargetState {
-        format,
-        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-        write_mask: wgpu::ColorWrites::ALL,
-    }
-}
-
 /// All pipelines plus the bind group they share.
 pub struct PipelineSet {
     pub globals_layout: wgpu::BindGroupLayout,
@@ -225,7 +221,7 @@ impl PipelineSet {
         // per frame instead of once per draw.
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shared-pipeline-layout"),
-            bind_group_layouts: &[&globals_layout],
+            bind_group_layouts: &[Some(&globals_layout)],
             immediate_size: 0,
         });
 
@@ -252,85 +248,65 @@ impl PipelineSet {
             count: msaa_samples,
             ..Default::default()
         };
-        let triangle_list = wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: None,
-            ..Default::default()
-        };
 
-        // Build one pipeline per (module, vertex layout, depth policy) pair.
-        // The closure owns the `ShaderModule` so both stages can borrow it.
-        let build = |name: &'static str,
-                     source: &str,
-                     layout: wgpu::VertexBufferLayout<'static>,
-                     depth_stencil: Option<wgpu::DepthStencilState>,
-                     cull: Option<wgpu::Face>| {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(name),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[layout],
-                },
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: cull,
-                    ..triangle_list
-                },
-                depth_stencil,
-                multisample: msaa,
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fs"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(target)],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-
-        let line_quad = build(
+        // `depth_test_only` is cloned for the two read-only pipelines: the
+        // option is moved into the first call.
+        let line_quad = build_pipeline(
+            device,
+            &pipeline_layout,
             "line-quad-2d",
-            &concat!(shaders::WGSL_GLOBALS, shaders::WGSL_LINE_QUAD_2D),
+            shaders::line_quad_2d(),
             line_quad_layout(),
             None,
             None,
+            &msaa,
+            &target,
         );
-        let ui = build(
+        let ui = build_pipeline(
+            device,
+            &pipeline_layout,
             "ui",
-            &concat!(shaders::WGSL_GLOBALS, shaders::WGSL_UI),
+            shaders::ui(),
             ui_layout(),
             None,
             None,
+            &msaa,
+            &target,
         );
-        let solid = build(
+        let solid = build_pipeline(
+            device,
+            &pipeline_layout,
             "solid-3d",
-            &concat!(shaders::WGSL_GLOBALS, shaders::WGSL_SOLID_3D),
+            shaders::solid_3d(),
             solid_layout(),
             depth_write,
             // Solids are back-face culled; lines and UI quads are not, because
             // their winding depends on the drag direction.
             Some(wgpu::Face::Back),
+            &msaa,
+            &target,
         );
-        let line3d = build(
+        let line3d = build_pipeline(
+            device,
+            &pipeline_layout,
             "line-3d",
-            &concat!(shaders::WGSL_GLOBALS, shaders::WGSL_LINE_3D),
+            shaders::line_3d(),
             line3d_layout(),
-            depth_test_only,
+            depth_test_only.clone(),
             None,
+            &msaa,
+            &target,
         );
-        let grid = build(
+        let grid = build_pipeline(
+            device,
+            &pipeline_layout,
             "grid-3d",
-            &concat!(shaders::WGSL_GLOBALS, shaders::WGSL_GRID_3D),
+            shaders::grid_3d(),
             grid_layout(),
             depth_test_only,
             None,
+            &msaa,
+            &target,
         );
 
         Self {
@@ -352,46 +328,6 @@ impl PipelineSet {
     }
 }
 
-fn module(device: &wgpu::Device, name: &'static str, source: &str) -> wgpu::ShaderModule {
-    device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(name),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    })
-}
-
-/// Vertex + fragment states for a pipeline whose two stages share one module.
-///
-/// Returning a tuple lets the caller bind the same `ShaderModule` to both
-/// stages, which halves the module count. `buffers` must outlive the pipeline
-/// descriptor, so it is passed by reference straight from a `const`.
-#[allow(clippy::type_complexity)]
-fn states<'a>(
-    device: &wgpu::Device,
-    name: &'static str,
-    source: &str,
-    buffers: &'a [wgpu::VertexBufferLayout<'a>],
-    targets: &'a [Option<wgpu::ColorTargetState>],
-) -> (
-    wgpu::ShaderModule,
-    wgpu::VertexState<'a>,
-    wgpu::FragmentState<'a>,
-) {
-    let m = module(device, name, source);
-    let vertex = wgpu::VertexState {
-        module: &m,
-        entry_point: Some("vs"),
-        compilation_options: Default::default(),
-        buffers,
-    };
-    let fragment = wgpu::FragmentState {
-        module: &m,
-        entry_point: Some("fs"),
-        compilation_options: Default::default(),
-        targets,
-    };
-    (m, vertex, fragment)
-}
-
 /// Expand CPU line segments into GPU triangles.
 ///
 /// Each segment becomes 6 vertices; this keeps the shader trivial and, unlike the
@@ -410,7 +346,7 @@ pub fn expand_lines(lines: &[LineVertex], out: &mut Vec<LineQuadVertex>) {
         let nx = -dy / len;
         let ny = dx / len;
         // Corner offsets: (-1, 0) start-left, (+1, 0) start-right, etc.
-        let corners: [(f32, f32, f32, f32); 4] = [
+        let corners: [(f32, f32, f32, f32); 6] = [
             (-1.0, 0.0, ax, ay),
             (1.0, 0.0, ax, ay),
             (1.0, len, bx, by),
@@ -430,6 +366,54 @@ pub fn expand_lines(lines: &[LineVertex], out: &mut Vec<LineQuadVertex>) {
             });
         }
     }
+}
+
+/// Compile one render pipeline.
+///
+/// Takes the composed WGSL by value: `concat!` cannot reference a `const` path, so
+/// `shaders::*` returns a `String`. Sharing the module between the vertex and
+/// fragment states halves the module count.
+#[allow(clippy::too_many_arguments)]
+fn build_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    name: &'static str,
+    source: String,
+    buffers: wgpu::VertexBufferLayout<'static>,
+    depth_stencil: Option<wgpu::DepthStencilState>,
+    cull: Option<wgpu::Face>,
+    msaa: &wgpu::MultisampleState,
+    target: &wgpu::ColorTargetState,
+) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(name),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(name),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[Some(buffers)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: cull,
+            ..Default::default()
+        },
+        depth_stencil,
+        multisample: *msaa,
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(target.clone())],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 /// Byte size the 3D line vertex buffer needs.

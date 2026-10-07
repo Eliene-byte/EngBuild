@@ -281,9 +281,9 @@ impl Tool {
     /// Handle cursor motion (updates rubber bands and live previews).
     pub fn on_move(&mut self, _doc: &Document, _cam: &Camera2D, world: Vec2) -> ToolOutcome {
         match &mut self.state {
-            ToolState::Points {
-                drag_from, drag_to, ..
-            } => {
+            // `drag_from` is the anchor the user set; it stays put while
+            // `drag_to` tracks the cursor.
+            ToolState::Points { drag_to, .. } => {
                 *drag_to = Some(world);
                 ToolOutcome::None
             }
@@ -362,7 +362,7 @@ impl Tool {
                 points.clone()
             }
             _ => {
-                let mut points = vec![world];
+                let points = vec![world];
                 self.state = ToolState::Points {
                     points: points.clone(),
                     drag_from: None,
@@ -884,7 +884,7 @@ mod tests {
         t.on_click(&mut doc, &cam(), Vec2::ZERO, false);
         t.on_click(&mut doc, &cam(), Vec2::new(20.0, 10.0), false);
         assert_eq!(doc.entities.len(), 1);
-        match doc.entities.iter().next().unwrap().entity {
+        match &doc.entities.iter().next().unwrap().entity {
             cad_doc::EntityKind::Polyline(p) => {
                 assert!(p.closed);
                 assert_eq!(p.vertices.len(), 4);
@@ -952,10 +952,13 @@ mod tests {
         if let Some(e) = doc.entities.get_mut(id) {
             *e = e.translated(Vec3::new(100.0, 0.0, 0.0));
         }
-        assert!(matches!(doc.entities.get(id).unwrap().bounds_2d().center, c if c.x > 50.0));
+        // `center()` consumes `self`, so it cannot be called on a borrow of the
+        // Rect2; copy it out first.
+        let b = doc.entities.get(id).unwrap().bounds_2d();
+        assert!(b.center().x > 50.0);
         // Cancel puts it back.
         assert_eq!(t.cancel(&mut doc), ToolOutcome::Restore);
-        match doc.entities.get(id).unwrap().entity {
+        match &doc.entities.get(id).unwrap().entity {
             cad_doc::EntityKind::Circle(c) => assert!(c.center.distance(Vec2::ZERO) < 1e-5),
             _ => panic!(),
         }

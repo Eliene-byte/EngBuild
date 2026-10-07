@@ -450,14 +450,16 @@ impl<'a> Ui<'a> {
                     state.cursor = cursor;
                     changed = true;
                 }
-            } else if self.input.key_pressed(Key::Delete) {
-                if cursor < chars.len() {
-                    let mut out: String = chars[..cursor].iter().collect();
-                    out.extend(chars[cursor + 1..].iter());
-                    state.text = out;
-                    state.cursor = cursor;
-                    changed = true;
-                }
+            } else if self.input.key_pressed(Key::Delete)
+                // At the end there is nothing forward to delete; the caller
+                // handles backspace instead.
+                && cursor < chars.len()
+            {
+                let mut out: String = chars[..cursor].iter().collect();
+                out.extend(chars[cursor + 1..].iter());
+                state.text = out;
+                state.cursor = cursor;
+                changed = true;
             }
 
             // Typed text, filtered to what a coordinate field accepts.
@@ -525,7 +527,9 @@ impl<'a> Ui<'a> {
         let cx = r.min.x + 12.0;
         let cy = r.center().y;
         let s = 4.0;
-        let d = if expanded { s } else { s };
+        // Collapsed: a right-pointing caret. Expanded: a down-pointing
+        // triangle. Same size either way.
+        let d = s;
         let pts = if expanded {
             [(cx - d, cy - d * 0.5), (cx + d, cy - d * 0.5), (cx, cy + d)]
         } else {
@@ -804,6 +808,12 @@ mod tests {
     #[test]
     fn selection_delete_works() {
         let (mut i, mut b, mut v) = setup();
+        // Exercise the fixture: this test is about `TextEditState`, but the
+        // setup returns widgets' dependencies.
+        {
+            let mut u = ui(&mut i, &mut b, &mut v);
+            assert!(!u.interact(0, rect(), true).interacted());
+        }
         let mut state = TextEditState::new("12345");
         state.focused = true;
         state.select_all();
@@ -923,13 +933,18 @@ mod tests {
     #[test]
     fn rect_helpers_emit_expected_quad_counts() {
         let (mut i, mut b, mut v) = setup();
+        // Scope each widget so its borrows of `b` and `v` end before the
+        // asserts read `v`.
         {
-            let u = ui(&mut i, &mut b, &mut v);
+            let mut u = ui(&mut i, &mut b, &mut v);
             u.fill_rect(rect(), Rgba::WHITE);
-            assert_eq!(v.len(), 6, "a rect is two triangles");
-            v.clear();
-            u.stroke_rect(rect(), Rgba::WHITE, 2.0);
-            assert_eq!(v.len(), 24, "a stroked rect is four bars of two triangles");
         }
+        assert_eq!(v.len(), 6, "a rect is two triangles");
+        v.clear();
+        {
+            let mut u = ui(&mut i, &mut b, &mut v);
+            u.stroke_rect(rect(), Rgba::WHITE, 2.0);
+        }
+        assert_eq!(v.len(), 24, "a stroked rect is four bars of two triangles");
     }
 }

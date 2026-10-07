@@ -172,8 +172,11 @@ impl LineWeight {
 }
 
 /// A linetype: a repeating dash pattern plus an optional text/shape element.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum LineType {
+    /// The default: BYLAYER entities inherit their layer's linetype, and an
+    /// unresolvable linetype falls back to this rather than to nothing.
+    #[default]
     Continuous,
     ByLayer,
     ByBlock,
@@ -183,12 +186,6 @@ pub enum LineType {
     },
     /// Dot / centre / dash-dot style, resolved into a pattern.
     Named(&'static str),
-}
-
-impl Default for LineType {
-    fn default() -> Self {
-        LineType::Continuous
-    }
 }
 
 impl LineType {

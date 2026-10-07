@@ -299,40 +299,33 @@ impl Mat4 {
         }
         let id = 1.0 / det;
         let m = |r: usize, c: usize| self.col(c).to_array()[r];
-        // A^-1 = adj(A)/det, adj = C^T, so inv[r][c] = C[c][r] / det
-        let mut inv = [[0.0f32; 4]; 4];
-        for r in 0..4 {
-            for c in 0..4 {
+
+        // A^-1 = adj(A)/det and adj = C^T, so inv[r][c] = C[c][r]/det, where
+        // C[r][c] is the cofactor of row r, column c.
+        //
+        // Column `c` of the inverse therefore collects inv[0..4][c] — that is,
+        // the four *rows* at a fixed column index. Getting this backwards yields
+        // a matrix that is a plausible-looking transpose and silently wrong.
+        let mut cols: Vec<Vec4> = Vec::with_capacity(4);
+        for c in 0..4 {
+            let mut col = [0.0f32; 4];
+            // The cofactor at (c, r) is the 3x3 minor left after deleting row `c`
+            // and column `r`, times (-1)^(r+c). Both loops filter rather than
+            // skip, so no accumulator counter is needed.
+            for (r, slot) in col.iter_mut().enumerate() {
+                let rows = (0..4).filter(|&rr| rr != c);
                 let mut sub = [[0.0f32; 3]; 3];
-                let mut i = 0;
-                for rr in 0..4 {
-                    if rr == c {
-                        continue;
-                    }
-                    let mut j = 0;
-                    for cc in 0..4 {
-                        if cc == r {
-                            continue;
-                        }
+                for (i, rr) in rows.enumerate() {
+                    for (j, cc) in (0..4).filter(|&cc| cc != r).enumerate() {
                         sub[i][j] = m(rr, cc);
-                        j += 1;
                     }
-                    i += 1;
                 }
-                let cof = det3(sub);
-                inv[r][c] = if (r + c) % 2 == 0 {
-                    cof * id
-                } else {
-                    -cof * id
-                };
+                let sign = if (r + c) % 2 == 0 { 1.0 } else { -1.0 };
+                *slot = det3(sub) * id * sign;
             }
+            cols.push(Vec4::new(col[0], col[1], col[2], col[3]));
         }
-        Self::from_cols(
-            Vec4::new(inv[0][0], inv[1][0], inv[2][0], inv[3][0]),
-            Vec4::new(inv[0][1], inv[1][1], inv[2][1], inv[3][1]),
-            Vec4::new(inv[0][2], inv[1][2], inv[2][2], inv[3][2]),
-            Vec4::new(inv[0][3], inv[1][3], inv[2][3], inv[3][3]),
-        )
+        Self::from_cols(cols[0], cols[1], cols[2], cols[3])
     }
 
     /// Right-handed look-at view matrix (camera looks down `-Z`).
@@ -436,16 +429,18 @@ fn det4(m: Mat4) -> f32 {
     let at = |r: usize, c: usize| m.col(c).to_array()[r];
     let mut det = 0.0;
     for c in 0..4 {
+        // Expanding along row 0: for each column, the 3x3 minor uses the
+        // remaining three rows. Filling it with two explicit counters avoids
+        // the `continue`-and-index pattern, which needs an accumulator the
+        // borrow checker cannot see through.
         let mut sub = [[0.0f32; 3]; 3];
         let mut i = 0;
         for cc in 0..4 {
             if cc == c {
                 continue;
             }
-            let mut j = 0;
-            for r in 1..4 {
-                sub[i][j] = at(r, cc);
-                j += 1;
+            for (j, row) in [1usize, 2, 3].into_iter().enumerate() {
+                sub[i][j] = at(row, cc);
             }
             i += 1;
         }

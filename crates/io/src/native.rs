@@ -495,10 +495,10 @@ pub fn decode(bytes: &[u8], doc: &mut Document) -> Result<(), NativeError> {
                             collected.push(e);
                         }
                     }
-                    if let Some(id) = block_ids.last() {
-                        if let Some(blk) = doc.blocks.by_id_mut(*id) {
-                            blk.entities = collected;
-                        }
+                    if let Some(id) = block_ids.last()
+                        && let Some(blk) = doc.blocks.by_id_mut(*id)
+                    {
+                        blk.entities = collected;
                     }
                 }
             }

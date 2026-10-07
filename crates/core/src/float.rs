@@ -8,6 +8,7 @@ pub const EPS_TIGHT: f32 = 1.0e-9;
 pub const TAU: f32 = core::f32::consts::PI * 2.0;
 pub const PI: f32 = core::f32::consts::PI;
 pub const FRAC_PI_2: f32 = core::f32::consts::FRAC_PI_2;
+pub const FRAC_PI_4: f32 = core::f32::consts::FRAC_PI_4;
 pub const DEG: f32 = 180.0 / PI;
 pub const RAD: f32 = PI / 180.0;
 
@@ -41,15 +42,21 @@ pub const fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 /// Wrap an angle into `(-PI, PI]`.
+///
+/// `%` keeps the sign of the dividend, so the two branches below handle the
+/// positive and negative overflow. The result maps `-PI` to `+PI` so that the
+/// interval stays half-open: an angle of exactly `PI` and one of exactly `-PI`
+/// represent the same direction and must not both be reachable.
 #[inline]
-pub fn wrap_pi(mut a: f32) -> f32 {
-    a = a % TAU;
-    if a > PI {
-        a -= TAU;
-    } else if a <= -PI {
-        a += TAU;
+pub fn wrap_pi(a: f32) -> f32 {
+    let m = a % TAU;
+    if m > PI {
+        m - TAU
+    } else if m <= -PI {
+        m + TAU
+    } else {
+        m
     }
-    a
 }
 
 /// Wrap an angle into `[0, TAU)`.

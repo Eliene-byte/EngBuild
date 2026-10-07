@@ -6,6 +6,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use cad_core::{Rgba, Vec2, Vec3};
+use std::mem::size_of;
 
 /// A 2D line segment in **screen pixels**, expanded on the CPU.
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -54,15 +55,26 @@ pub struct UiVertex {
 }
 
 impl UiVertex {
+    /// A flat rect vertex.
+    ///
+    /// This only carries the colour and shape parameters; `push_rect` and
+    /// `push_rounded_rect` set the four corner positions, because a vertex is
+    /// not a rect. `x`, `y`, `w` and `h` are the rect's top-left and size, kept
+    /// in the signature so a caller can express "a rect at this position" as one
+    /// expression before pushing it.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn rect(x: f32, y: f32, w: f32, h: f32, color: Rgba) -> Self {
         Self {
             pos: [x, y],
-            uv: [0.0, 0.0],
+            // Carrying the rect's size here means a caller can use this vertex as
+            // a complete rect without also calling `push_rect`; `push_rect`
+            // overwrites uv per corner.
+            uv: [w, h],
             color: color.to_array(),
             shape: 0.0,
             radius: 0.0,
             border: 0.0,
-            half_ext: [0.0, 0.0],
+            half_ext: [w * 0.5, h * 0.5],
         }
     }
     pub fn rounded(mut self, radius: f32) -> Self {
@@ -153,6 +165,26 @@ pub fn stroke_rect(out: &mut Vec<UiVertex>, r: Rect, color: Rgba, width: f32) {
 /// Rectangle alias so this module does not need the core import everywhere.
 pub type Rect = cad_core::Rect2;
 
+/// A dash pattern in screen pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Dash {
+    /// Length of each drawn run.
+    pub on: f32,
+    /// Length of each gap.
+    pub off: f32,
+    /// Offset into the pattern, so a dash pattern does not crawl while panning.
+    pub phase: f32,
+}
+
+impl Dash {
+    pub const fn new(on: f32, off: f32, phase: f32) -> Self {
+        Self { on, off, phase }
+    }
+}
+
+/// Indices per triangle in a mesh index list.
+const TRI: usize = 3;
+
 /// Accumulates 2D line geometry for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct Batch2d {
@@ -181,19 +213,16 @@ impl Batch2d {
         self.bytes += std::mem::size_of::<LineVertex>();
     }
     /// Add a dashed segment. `pattern` is `(on_px, off_px, phase_px)`.
-    pub fn dashed(
-        &mut self,
-        a: Vec2,
-        b: Vec2,
-        color: Rgba,
-        width: f32,
-        on: f32,
-        off: f32,
-        phase: f32,
-    ) {
-        self.lines
-            .push(LineVertex::new(a, b, color, width).dashed(on, off, phase));
-        self.bytes += std::mem::size_of::<LineVertex>();
+    ///
+    /// Bundled into one struct so adding a fourth dash parameter does not push
+    /// the argument list past the point of readability.
+    pub fn dashed(&mut self, a: Vec2, b: Vec2, color: Rgba, width: f32, pattern: Dash) {
+        self.lines.push(LineVertex::new(a, b, color, width).dashed(
+            pattern.on,
+            pattern.off,
+            pattern.phase,
+        ));
+        self.bytes += size_of::<LineVertex>();
     }
     /// Add a closed polyline in screen space.
     pub fn polyline(&mut self, pts: &[Vec2], color: Rgba, width: f32) {
@@ -360,8 +389,10 @@ impl Batch3d {
     }
     /// Add a mesh from the document model.
     pub fn mesh(&mut self, m: &cad_doc::entity::Mesh3d, color: Rgba) {
-        for tri in m.indices.chunks_exact(3) {
-            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        for t in 0..m.indices.len() / TRI {
+            let i0 = m.indices[t * TRI] as usize;
+            let i1 = m.indices[t * TRI + 1] as usize;
+            let i2 = m.indices[t * TRI + 2] as usize;
             let (a, b, c) = (m.positions[i0], m.positions[i1], m.positions[i2]);
             let n = if m.normals.len() == m.positions.len() {
                 m.normals[i0]

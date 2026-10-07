@@ -55,7 +55,7 @@ impl Theme {
             background: Rgba::new(0.094, 0.102, 0.118, 1.0),
             surface: Rgba::new(0.145, 0.157, 0.180, 1.0),
             surface_hover: Rgba::new(0.196, 0.212, 0.243, 1.0),
-            surface_active: Rgba::new(0.247, 0.271, 0.318, 1.0),
+            surface_active: Rgba::from_srgb_u8(0x3F, 0x45, 0x51, 0xFF),
             canvas: Rgba::new(0.055, 0.063, 0.078, 1.0),
             border: Rgba::new(0.243, 0.263, 0.302, 1.0),
             border_focused: Rgba::new(0.302, 0.541, 0.949, 1.0),
