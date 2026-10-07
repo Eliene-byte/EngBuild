@@ -18,7 +18,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_TERM_COLOR: always
+  # `never`, not `always`: ANSI colour codes would sit in front of every
+  # diagnostic and defeat the file:line parsing that turns them into check
+  # annotations.
+  CARGO_TERM_COLOR: never
   RUST_BACKTRACE: 1
 
 jobs:
@@ -57,7 +60,11 @@ jobs:
           # The runner invokes this with `bash -e`, so the command must not be
           # allowed to abort the script before the diagnostics are re-emitted.
           status=0
-          cargo clippy --workspace --all-targets --message-format=short -- -D warnings \
+          # -j 2: clippy on wgpu/naga is the peak-memory step in this build, and
+          # a cold-cache runner that gets OOM-killed exits 101 with no
+          # diagnostic at all. Fewer parallel jobs lowers the peak.
+          cargo clippy --workspace --all-targets -j 2 \
+            --message-format=short -- -D warnings \
             > clippy.log 2>&1 || status=$?
           cat clippy.log
           if [ "$status" -ne 0 ]; then
@@ -88,6 +95,14 @@ jobs:
             fi
           fi
           exit "$status"
+
+      - name: Upload lint log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-log
+          path: clippy.log
+          if-no-files-found: ignore
 
       # No GPU in CI, so the headless tests must not need one.
       - name: Test
