@@ -7,8 +7,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use cad_app::command::CommandResult;
 use cad_app::session::{Session, StatusMessage};
-use cad_core::{Camera2D, Rgba, Rect2, Vec2};
+use cad_core::{Camera2D, Rect2, Rgba, Vec2};
 use cad_doc::EntityId;
 use cad_gfx::batch::{Batch2d, Batch3d, UiVertex, push_rect};
 use cad_gfx::renderer::{FrameError, Gpu, SurfaceConfig};
@@ -77,6 +78,8 @@ pub struct App {
     pub command_line: String,
     /// Where a left-drag started, in world coordinates.
     pub selection_anchor: Option<Vec2>,
+    /// Current keyboard modifiers, tracked from winit's `ModifiersChanged`.
+    mods: Modifiers,
     start: Instant,
     last: Instant,
 }
@@ -95,7 +98,11 @@ impl App {
 
         let gpu = Gpu::new(
             window.clone(),
-            SurfaceConfig { width: size.width.max(1), height: size.height.max(1), msaa_samples: 4 },
+            SurfaceConfig {
+                width: size.width.max(1),
+                height: size.height.max(1),
+                msaa_samples: 4,
+            },
         )?;
 
         let mut input = InputState::new();
@@ -112,6 +119,7 @@ impl App {
             frame: 0,
             command_line: String::new(),
             selection_anchor: None,
+            mods: Modifiers::NONE,
             start: now,
             last: now,
         };
@@ -159,8 +167,13 @@ impl App {
             winit::event::WindowEvent::CloseRequested => self.should_close = true,
             winit::event::WindowEvent::Resized(size) => {
                 self.relayout();
-                self.input
-                    .push(&Event::Resized { width: size.width, height: size.height }, self.now());
+                self.input.push(
+                    &Event::Resized {
+                        width: size.width,
+                        height: size.height,
+                    },
+                    self.now(),
+                );
             }
             winit::event::WindowEvent::CursorMoved { position, .. } => {
                 let p = self.to_css(position);
@@ -171,7 +184,11 @@ impl App {
                 let p = self.input.mouse;
                 let b = map_button(*button);
                 let down = *state == winit::event::ElementState::Pressed;
-                let ev = if down { Event::MouseDown { pos: p, button: b } } else { Event::MouseUp { pos: p, button: b } };
+                let ev = if down {
+                    Event::MouseDown { pos: p, button: b }
+                } else {
+                    Event::MouseUp { pos: p, button: b }
+                };
                 self.input.push(&ev, self.now());
                 if down {
                     self.on_mouse_down(b);
@@ -190,28 +207,50 @@ impl App {
                 self.input.push(&Event::MouseWheel { delta: d }, self.now());
                 self.on_scroll(d);
             }
-            winit::event::WindowEvent::KeyboardInput { event, .. } => {
-                let mods = Modifiers {
-                    shift: event.state.is_pressed(),
-                    ctrl: event.modifiers.control_key(),
-                    alt: event.modifiers.alt_key(),
-                    super_key: event.modifiers.super_key(),
+            // winit delivers modifier state as its own `ModifiersChanged` event,
+            // not as a field on the key event, so `self.mods` is the
+            // authoritative current state. Reading it here is what stops Ctrl+Z
+            // firing when the modifier event has not arrived yet.
+            winit::event::WindowEvent::ModifiersChanged(m) => {
+                // winit 0.30 replaced the per-modifier `bool` accessors with a
+                // `ModifiersState` bitflag; the predicates still exist, but on
+                // the state rather than on `Modifiers` itself.
+                let s = m.state();
+                self.mods = Modifiers {
+                    shift: s.shift_key(),
+                    ctrl: s.control_key(),
+                    alt: s.alt_key(),
+                    super_key: s.super_key(),
                 };
+            }
+            winit::event::WindowEvent::KeyboardInput { event, .. } => {
+                let mods = self.mods;
                 if let Some(k) = map_key(&event.logical_key) {
                     let down = event.state.is_pressed();
-                    let ev = if down { Event::KeyDown { key: k, mods } } else { Event::KeyUp { key: k, mods } };
+                    let ev = if down {
+                        Event::KeyDown { key: k, mods }
+                    } else {
+                        Event::KeyUp { key: k, mods }
+                    };
                     self.input.push(&ev, self.now());
-                    if down {
+                    // `repeat` is the OS re-sending the same press while the key
+                    // is held. It must not re-trigger a shortcut or append a
+                    // second character to the command line.
+                    if down && !event.repeat {
                         self.on_key(k, mods);
                     }
                 }
-                if event.state.is_pressed() {
-                    if let Some(t) = event.text.as_ref() {
-                        let t: String = t.chars().filter(|c| !c.is_control()).collect();
-                        if !t.is_empty() {
-                            self.input.push(&Event::Text(t), self.now());
-                            self.on_text();
-                        }
+                // Text arrives on the same event as the key. Control
+                // characters (Enter, Backspace) are dropped here because they
+                // have their own Key paths and would otherwise be typed twice.
+                if event.state.is_pressed()
+                    && !event.repeat
+                    && let Some(text) = event.text.as_ref()
+                {
+                    let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+                    if !typed.is_empty() {
+                        self.input.push(&Event::Text(typed), self.now());
+                        self.on_text();
                     }
                 }
             }
@@ -238,10 +277,11 @@ impl App {
             self.session.pan_screen(self.input.mouse_delta);
             return;
         }
-        if self.input.is_down(MouseButton::Left) {
-            if let Some(anchor) = self.selection_anchor {
-                self.session.window_drag = Some((anchor, world));
-            }
+        // A held left button drags the selection rectangle from its anchor.
+        if self.input.is_down(MouseButton::Left)
+            && let Some(anchor) = self.selection_anchor
+        {
+            self.session.window_drag = Some((anchor, world));
         }
         self.session.update_cursor();
     }
@@ -292,7 +332,8 @@ impl App {
         match key {
             Key::F1 => {
                 let n = self.session.commands.len();
-                self.session.status = StatusMessage::info(format!("{n} commands - type help for the common ones"));
+                self.session.status =
+                    StatusMessage::info(format!("{n} commands - type help for the common ones"));
                 return;
             }
             Key::F3 => {
@@ -368,11 +409,13 @@ impl App {
         }
 
         // Plain letters go to the command line unless a tool is mid-prompt.
-        if self.session.tool.prompt().is_none() {
-            if let Some(c) = key.as_letter() {
-                self.command_line.push(c);
-                return;
-            }
+        // Plain letters type into the command line, but only when no tool is
+        // waiting for a specific key.
+        if self.session.tool.prompt().is_none()
+            && let Some(c) = key.as_letter()
+        {
+            self.command_line.push(c);
+            return;
         }
 
         let outcome = self.session.tool.on_key(&mut self.session.doc, key);
@@ -386,21 +429,39 @@ impl App {
     }
 
     /// Run a command line such as `line` or `undo 3`.
-    pub fn run_command(&mut self, line: &str) {
+    ///
+    /// Returns the command's own result so a caller (or a test) can tell whether
+    /// the command ran, was unavailable, or failed. Unknown names come back as
+    /// `Error` after having been reported on the status bar.
+    pub fn run_command(&mut self, line: &str) -> CommandResult {
         let line = line.trim();
         if line.is_empty() {
-            return;
+            // Nothing typed: not an error, just no-op.
+            return CommandResult::Ok;
         }
-        let name = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-        match name.as_str() {
+        let name = line
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        // Every arm yields a CommandResult so the caller can report success;
+        // the old version mixed `()` and `CommandResult`, which did not compile.
+        let result = match name.as_str() {
             "undo" | "u" => self.session.undo(),
             "redo" => self.session.redo(),
             "zoomall" | "z" => {
                 self.session.zoom_extents();
                 self.session.status = StatusMessage::info("Zoom extents");
+                CommandResult::Ok
             }
-            "zoomin" => self.session.zoom_by(1.25),
-            "zoomout" => self.session.zoom_by(1.0 / 1.25),
+            "zoomin" => {
+                self.session.zoom_by(1.25);
+                CommandResult::Ok
+            }
+            "zoomout" => {
+                self.session.zoom_by(1.0 / 1.25);
+                CommandResult::Ok
+            }
             "view3d" => self.session.toggle_3d(),
             "grid" => self.session.toggle_grid(),
             "snap" => self.session.toggle_snap(),
@@ -409,27 +470,36 @@ impl App {
             "erase" | "e" => {
                 if self.session.tool.selection.is_empty() {
                     self.session.status = StatusMessage::info("Select objects, then Erase");
+                    CommandResult::Unavailable
                 } else {
-                    self.session.delete_selection();
+                    self.session.delete_selection()
                 }
             }
-            "selectall" | "all" => self.session.select_all(),
+            // `select_all` mutates in place and reports nothing; wrap it so
+            // every arm of this match yields a CommandResult.
+            "selectall" | "all" => {
+                self.session.select_all();
+                CommandResult::Ok
+            }
             "delete" | "del" => self.session.delete_selection(),
             "help" | "?" => {
                 self.session.status = StatusMessage::info(
                     "Commands: line, circle, arc, polyline, rect, erase, move, undo, zoomall, view3d",
                 );
+                CommandResult::Ok
             }
             other => {
                 let known = self.session.commands.get(other).is_some();
                 if known || cad_app::session::tool_for_command(other).is_some() {
-                    self.session.activate(other);
+                    self.session.activate(other)
                 } else {
                     self.session.status = StatusMessage::error(format!("Unknown command: {other}"));
+                    CommandResult::Error(format!("Unknown command: {other}"))
                 }
             }
-        }
+        };
         self.session.dirty = true;
+        result
     }
 
     /// Advance time-dependent state and render.
@@ -458,7 +528,10 @@ impl App {
             self.session.viewport.cam2d.scale,
             dpr,
             self.session.time,
-            [self.session.viewport.cam3d.eye.x, self.session.viewport.cam3d.eye.y],
+            [
+                self.session.viewport.cam3d.eye.x,
+                self.session.viewport.cam3d.eye.y,
+            ],
         );
         self.gpu.render(&lines, &ui, &solids)?;
         self.frame += 1;
@@ -472,17 +545,30 @@ pub fn build_geometry(app: &App, dpr: f32) -> (Batch2d, Batch3d, Vec<UiVertex>) 
     let theme = app.session.theme;
     let panels = app.panels;
     let mut lines = Batch2d::new();
-    let mut solids = Batch3d::new();
+    let solids = Batch3d::new();
     let mut ui: Vec<UiVertex> = Vec::new();
 
     let c = panels.canvas;
-    push_rect(&mut ui, c.min.x * dpr, c.min.y * dpr, c.width() * dpr, c.height() * dpr, theme.canvas);
+    push_rect(
+        &mut ui,
+        c.min.x * dpr,
+        c.min.y * dpr,
+        c.width() * dpr,
+        c.height() * dpr,
+        theme.canvas,
+    );
 
     if app.session.viewport.show_grid {
         draw_grid(&mut lines, &cam, c, dpr, &app.session.viewport, theme.grid);
     }
     if app.session.viewport.show_axes {
-        draw_axes(&mut lines, cam.world_to_screen(Vec2::ZERO) * dpr, c, dpr, theme);
+        draw_axes(
+            &mut lines,
+            cam.world_to_screen(Vec2::ZERO) * dpr,
+            c,
+            dpr,
+            theme,
+        );
     }
 
     let hover = app.session.tool.hovered;
@@ -533,7 +619,14 @@ pub fn build_geometry(app: &App, dpr: f32) -> (Batch2d, Batch3d, Vec<UiVertex>) 
     // Panels.
     let full_w = panels.properties.max.x;
     let full_h = (panels.status_bar.max.y).max(panels.command_line.max.y);
-    push_rect(&mut ui, 0.0, 0.0, full_w * dpr, panels.ribbon.height() * dpr, theme.background);
+    push_rect(
+        &mut ui,
+        0.0,
+        0.0,
+        full_w * dpr,
+        panels.ribbon.height() * dpr,
+        theme.background,
+    );
     push_rect(
         &mut ui,
         0.0,
@@ -561,10 +654,22 @@ pub fn build_geometry(app: &App, dpr: f32) -> (Batch2d, Batch3d, Vec<UiVertex>) 
 
     // Separators.
     let seps = [
-        (Vec2::new(panels.canvas.min.x * dpr, 0.0), Vec2::new(panels.canvas.min.x * dpr, full_h * dpr)),
-        (Vec2::new(panels.properties.min.x * dpr, 0.0), Vec2::new(panels.properties.min.x * dpr, full_h * dpr)),
-        (Vec2::new(0.0, panels.ribbon.max.y * dpr), Vec2::new(full_w * dpr, panels.ribbon.max.y * dpr)),
-        (Vec2::new(0.0, panels.command_line.min.y * dpr), Vec2::new(full_w * dpr, panels.command_line.min.y * dpr)),
+        (
+            Vec2::new(panels.canvas.min.x * dpr, 0.0),
+            Vec2::new(panels.canvas.min.x * dpr, full_h * dpr),
+        ),
+        (
+            Vec2::new(panels.properties.min.x * dpr, 0.0),
+            Vec2::new(panels.properties.min.x * dpr, full_h * dpr),
+        ),
+        (
+            Vec2::new(0.0, panels.ribbon.max.y * dpr),
+            Vec2::new(full_w * dpr, panels.ribbon.max.y * dpr),
+        ),
+        (
+            Vec2::new(0.0, panels.command_line.min.y * dpr),
+            Vec2::new(full_w * dpr, panels.command_line.min.y * dpr),
+        ),
     ];
     for (a, b) in seps {
         lines.segment(a, b, theme.border, dpr);
@@ -594,7 +699,14 @@ fn stroke_world_rect(lines: &mut Batch2d, cam: &Camera2D, r: Rect2, dpr: f32, co
     lines.segment(Vec2::new(a.x, b.y), a, color, dpr);
 }
 
-fn draw_grid(lines: &mut Batch2d, cam: &Camera2D, canvas: Rect2, dpr: f32, vp: &cad_app::session::Viewport, color: Rgba) {
+fn draw_grid(
+    lines: &mut Batch2d,
+    cam: &Camera2D,
+    canvas: Rect2,
+    dpr: f32,
+    vp: &cad_app::session::Viewport,
+    color: Rgba,
+) {
     let step = vp.grid_spacing;
     if step <= 0.0 {
         return;
@@ -607,7 +719,12 @@ fn draw_grid(lines: &mut Batch2d, cam: &Camera2D, canvas: Rect2, dpr: f32, vp: &
     let mut n = 0;
     while x <= view.max.x && n < 512 {
         let sx = cam.world_to_screen(Vec2::new(x, 0.0)).x * dpr;
-        lines.segment(Vec2::new(sx, canvas.min.y * dpr), Vec2::new(sx, canvas.max.y * dpr), color, dpr);
+        lines.segment(
+            Vec2::new(sx, canvas.min.y * dpr),
+            Vec2::new(sx, canvas.max.y * dpr),
+            color,
+            dpr,
+        );
         x += step;
         n += 1;
     }
@@ -615,7 +732,12 @@ fn draw_grid(lines: &mut Batch2d, cam: &Camera2D, canvas: Rect2, dpr: f32, vp: &
     let mut n = 0;
     while y <= view.max.y && n < 512 {
         let sy = cam.world_to_screen(Vec2::new(0.0, y)).y * dpr;
-        lines.segment(Vec2::new(canvas.min.x * dpr, sy), Vec2::new(canvas.max.x * dpr, sy), color, dpr);
+        lines.segment(
+            Vec2::new(canvas.min.x * dpr, sy),
+            Vec2::new(canvas.max.x * dpr, sy),
+            color,
+            dpr,
+        );
         y += step;
         n += 1;
     }
@@ -642,17 +764,30 @@ fn map_button(b: winit::event::MouseButton) -> MouseButton {
         winit::event::MouseButton::Right => MouseButton::Right,
         winit::event::MouseButton::Middle => MouseButton::Middle,
         winit::event::MouseButton::Other(n) => MouseButton::Other(n as u8),
+        // Added in winit 0.30. Treat them as "other" rather than dropping the
+        // event, so a stray click still closes menus.
+        winit::event::MouseButton::Back | winit::event::MouseButton::Forward => {
+            MouseButton::Other(0)
+        }
     }
 }
 
 fn map_key(k: &winit::keyboard::Key) -> Option<Key> {
     match k {
-        winit::keyboard::Key::Character(c) => char_to_key(*c),
+        // winit reports printable keys as a `SmolStr`, which on some layouts
+        // holds more than one character.
+        winit::keyboard::Key::Character(c) => c.chars().next().and_then(char_to_key),
         winit::keyboard::Key::Named(n) => named_key(n),
         _ => None,
     }
 }
 
+/// Map a winit [`NamedKey`] to the app's [`Key`].
+///
+/// Punctuation is deliberately absent: winit reports those as
+/// `Key::Character`, not as named keys, so they arrive through
+/// [`char_to_key`] instead. Getting this backwards would make "-" unmappable
+/// on every layout.
 fn named_key(n: &winit::keyboard::NamedKey) -> Option<Key> {
     use winit::keyboard::NamedKey as N;
     Some(match n {
@@ -683,21 +818,11 @@ fn named_key(n: &winit::keyboard::NamedKey) -> Option<Key> {
         N::F10 => Key::F10,
         N::F11 => Key::F11,
         N::F12 => Key::F12,
-        N::Minus => Key::Minus,
-        N::Equals => Key::Equals,
-        N::Comma => Key::Comma,
-        N::Period => Key::Period,
-        N::Slash => Key::Slash,
-        N::Backslash => Key::Backslash,
-        N::Semicolon => Key::Semicolon,
-        N::Quote => Key::Apostrophe,
-        N::BracketLeft => Key::LBracket,
-        N::BracketRight => Key::RBracket,
-        N::Backtick => Key::Backtick,
-        N::ShiftLeft | N::ShiftRight => Key::Shift,
-        N::ControlLeft | N::ControlRight => Key::Control,
-        N::AltLeft | N::AltRight => Key::Alt,
-        N::SuperLeft | N::SuperRight => Key::Super,
+        N::Shift => Key::Shift,
+        N::Control => Key::Control,
+        N::Alt => Key::Alt,
+        N::Super => Key::Super,
+        N::Meta => Key::Super,
         _ => return None,
     })
 }
@@ -705,11 +830,41 @@ fn named_key(n: &winit::keyboard::NamedKey) -> Option<Key> {
 fn char_to_key(c: char) -> Option<Key> {
     use Key::*;
     Some(match c.to_ascii_lowercase() {
-        'a' => A, 'b' => B, 'c' => C, 'd' => D, 'e' => E, 'f' => F, 'g' => G, 'h' => H,
-        'i' => I, 'j' => J, 'k' => K, 'l' => L, 'm' => M, 'n' => N, 'o' => O, 'p' => P,
-        'q' => Q, 'r' => R, 's' => T, 'u' => U, 'v' => V, 'w' => W, 'x' => X, 'y' => Y, 'z' => Z,
-        '0' => Num0, '1' => Num1, '2' => Num2, '3' => Num3, '4' => Num4,
-        '5' => Num5, '6' => Num6, '7' => Num7, '8' => Num8, '9' => Num9,
+        'a' => A,
+        'b' => B,
+        'c' => C,
+        'd' => D,
+        'e' => E,
+        'f' => F,
+        'g' => G,
+        'h' => H,
+        'i' => I,
+        'j' => J,
+        'k' => K,
+        'l' => L,
+        'm' => M,
+        'n' => N,
+        'o' => O,
+        'p' => P,
+        'q' => Q,
+        'r' => R,
+        's' => T,
+        'u' => U,
+        'v' => V,
+        'w' => W,
+        'x' => X,
+        'y' => Y,
+        'z' => Z,
+        '0' => Num0,
+        '1' => Num1,
+        '2' => Num2,
+        '3' => Num3,
+        '4' => Num4,
+        '5' => Num5,
+        '6' => Num6,
+        '7' => Num7,
+        '8' => Num8,
+        '9' => Num9,
         _ => return None,
     })
 }
@@ -775,8 +930,8 @@ impl winit::application::ApplicationHandler for Handler {
         match app.tick_and_draw() {
             Ok(()) | Err(FrameError::Skip) => {}
             Err(FrameError::Outdated) | Err(FrameError::Lost) => {
-                let (w, h) = app.window.inner_size();
-                app.gpu.resize(w.max(1), h.max(1));
+                let size = app.window.inner_size();
+                app.gpu.resize(size.width.max(1), size.height.max(1));
             }
             Err(e @ FrameError::Invalid) => {
                 eprintln!("render error: {e}");
@@ -881,10 +1036,34 @@ mod tests {
     #[test]
     fn key_mapping_covers_the_cad_shortcuts() {
         use winit::keyboard::Key as W;
-        assert_eq!(map_key(&W::Named(winit::keyboard::NamedKey::F3)), Some(Key::F3));
-        assert_eq!(map_key(&W::Named(winit::keyboard::NamedKey::Escape)), Some(Key::Escape));
-        assert_eq!(map_key(&W::Character('l')), Some(Key::L));
-        assert_eq!(map_key(&W::Character('7')), Some(Key::Num7));
-        assert_eq!(map_key(&W::Character('%')), None);
+        assert_eq!(
+            map_key(&W::Named(winit::keyboard::NamedKey::F3)),
+            Some(Key::F3)
+        );
+        assert_eq!(
+            map_key(&W::Named(winit::keyboard::NamedKey::Escape)),
+            Some(Key::Escape)
+        );
+        // winit reports printable keys as a SmolStr, so these are not `char`.
+        assert_eq!(map_key(&W::Character("l".into())), Some(Key::L));
+        assert_eq!(map_key(&W::Character("7".into())), Some(Key::Num7));
+        // Uppercase arrives as one character and must fold to the same key, or
+        // Shift+letter would stop working.
+        assert_eq!(map_key(&W::Character("L".into())), Some(Key::L));
+        // Punctuation has no Key variant, so it is dropped rather than guessed at.
+        assert_eq!(map_key(&W::Character("%".into())), None);
+    }
+
+    #[test]
+    fn modifier_keys_map_from_named_keys() {
+        use winit::keyboard::Key as W;
+        use winit::keyboard::NamedKey as N;
+        // Modifiers are NamedKey::Shift/Control/..., not per-side variants.
+        assert_eq!(map_key(&W::Named(N::Shift)), Some(Key::Shift));
+        assert_eq!(map_key(&W::Named(N::Control)), Some(Key::Control));
+        assert_eq!(map_key(&W::Named(N::Super)), Some(Key::Super));
+        // Left and right both report the same logical key, which is what makes
+        // Ctrl+Z work from either side.
+        assert_eq!(map_key(&W::Named(N::Alt)), Some(Key::Alt));
     }
 }

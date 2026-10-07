@@ -57,7 +57,7 @@ pub fn grid_3d() -> String {
     with_globals(WGSL_GRID_3D)
 }
 
-/// Global uniform block, mirrored in Rust by [`super::pipeline::Globals`].
+/// Global uniform block, mirrored in Rust by [`crate::pipeline::Globals`].
 pub const WGSL_GLOBALS: &str = r#"
 struct Globals {
     view_proj : mat4x4<f32>,

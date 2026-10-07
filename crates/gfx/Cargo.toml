@@ -9,7 +9,6 @@ authors.workspace = true
 
 [dependencies]
 cad-core = { workspace = true }
-cad-geom = { workspace = true }
 cad-doc = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }

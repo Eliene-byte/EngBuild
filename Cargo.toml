@@ -11,6 +11,35 @@ members = [
     "crates/app",
     ".",
 ]
+# `cad` is the binary and owns `src/main.rs`. Its library target is `src/lib.rs`,
+# renamed to `cadkit` so the binary can `use cadkit::...`.
+default-members = ["."]
+
+[package]
+name = "cad"
+description = "CADKit: vector 2D drafting and 3D modelling, on wgpu."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "cadkit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cad"
+path = "src/main.rs"
+
+[dependencies]
+cad-core = { workspace = true }
+cad-geom = { workspace = true }
+cad-doc = { workspace = true }
+cad-gfx = { workspace = true }
+cad-ui = { workspace = true }
+cad-app = { workspace = true }
+winit = { workspace = true }
 
 [workspace.package]
 version = "0.1.0"

@@ -11,7 +11,6 @@ authors.workspace = true
 cad-core = { workspace = true }
 cad-geom = { workspace = true }
 cad-doc = { workspace = true }
-cad-io = { workspace = true }
 cad-snap = { workspace = true }
 cad-gfx = { workspace = true }
 cad-ui = { workspace = true }
