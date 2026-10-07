@@ -109,8 +109,26 @@ jobs:
           if-no-files-found: ignore
 
       # No GPU in CI, so the headless tests must not need one.
+      # Same log-to-annotation treatment as clippy: `cargo test` failures are
+      # otherwise just an exit code, because test output goes to stdout and
+      # panics are not rustc diagnostics.
       - name: Test
-        run: cargo test --workspace
+        run: |
+          status=0
+          cargo test --workspace -j 2 --no-fail-fast > test.log 2>&1 || status=$?
+          cat test.log
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=test-summary::tests failed; see the failing cases below."
+            grep -E '^(test .*(FAILED|panicked)|failures:|error(\[|:))' test.log \
+              | head -60 | while IFS= read -r line; do
+                echo "::error title=test::$line"
+              done
+            tail -n 30 test.log | while IFS= read -r line; do
+              clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
+              echo "::error title=test-log::$clean"
+            done
+          fi
+          exit "$status"
 
       - name: Documentation
         run: cargo doc --workspace --no-deps
