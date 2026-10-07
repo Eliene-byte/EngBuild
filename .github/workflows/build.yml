@@ -74,8 +74,15 @@ jobs:
             # (bad manifest, unresolvable lockfile). Say so explicitly rather
             # than reporting a bare exit code.
             if ! grep -qE '^[^ ]+\.rs:[0-9]+:[0-9]+: error' clippy.log; then
-              echo "::error title=clippy::clippy failed with no Rust diagnostic; cargo itself could not complete. First 20 lines follow."
-              head -20 clippy.log
+              echo "::error title=clippy::clippy failed with no Rust diagnostic; cargo itself could not complete."
+              # One annotation per log line: a cargo-level failure (manifest,
+              # lockfile, rustup component, disk) otherwise shows up here as a
+              # bare exit code with nothing to go on.
+              n=0
+              while IFS= read -r line && [ "$n" -lt 40 ]; do
+                echo "::error title=clippy-log::$line"
+                n=$((n + 1))
+              done < clippy.log
             fi
           fi
           exit "$status"
