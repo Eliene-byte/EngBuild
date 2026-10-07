@@ -48,8 +48,29 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
+      # cargo writes diagnostics to stderr in a human format that the GitHub log
+      # viewer shows but does not turn into check annotations, so a failure here
+      # is invisible from the API. Re-emitting each error line as an `::error::`
+      # workflow command makes it a real annotation on the check run.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --message-format=short -- -D warnings \
+            2>&1 | tee clippy.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            echo "::group::clippy diagnostics"
+            grep -E '^[^ ].*: (error|warning)' clippy.log || true
+            echo "::endgroup::"
+            grep -oE '^[^ ]+\.rs:[0-9]+:[0-9]+: error[^:]*: .*' clippy.log | head -50 | \
+              while IFS= read -r line; do
+                file=$(echo "$line" | cut -d: -f1)
+                ln=$(echo "$line" | cut -d: -f2)
+                msg=$(echo "$line" | cut -d: -f5-)
+                echo "::error file=$file,line=$ln::$msg"
+              done
+          fi
+          exit "$status"
 
       # No GPU in CI, so the headless tests must not need one.
       - name: Test
