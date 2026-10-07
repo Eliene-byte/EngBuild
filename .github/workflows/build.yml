@@ -54,21 +54,29 @@ jobs:
       # workflow command makes it a real annotation on the check run.
       - name: Clippy
         run: |
-          set -o pipefail
+          # The runner invokes this with `bash -e`, so the command must not be
+          # allowed to abort the script before the diagnostics are re-emitted.
+          status=0
           cargo clippy --workspace --all-targets --message-format=short -- -D warnings \
-            2>&1 | tee clippy.log
-          status=${PIPESTATUS[0]}
+            > clippy.log 2>&1 || status=$?
+          cat clippy.log
           if [ "$status" -ne 0 ]; then
-            echo "::group::clippy diagnostics"
-            grep -E '^[^ ].*: (error|warning)' clippy.log || true
-            echo "::endgroup::"
-            grep -oE '^[^ ]+\.rs:[0-9]+:[0-9]+: error[^:]*: .*' clippy.log | head -50 | \
-              while IFS= read -r line; do
-                file=$(echo "$line" | cut -d: -f1)
-                ln=$(echo "$line" | cut -d: -f2)
-                msg=$(echo "$line" | cut -d: -f5-)
-                echo "::error file=$file,line=$ln::$msg"
-              done
+            # Re-emit each diagnostic as a workflow command so it becomes a real
+            # check annotation; without this a clippy failure is invisible
+            # outside the log viewer.
+            while IFS= read -r line; do
+              file=$(printf '%s' "$line" | cut -d: -f1)
+              ln=$(printf '%s' "$line" | cut -d: -f2)
+              msg=$(printf '%s' "$line" | cut -d: -f5-)
+              echo "::error file=$file,line=$ln,title=clippy::$msg"
+            done <<< "$(grep -E '^[^ ]+\.rs:[0-9]+:[0-9]+: error' clippy.log | head -50)"
+            # A failure with no parseable diagnostic means cargo itself gave up
+            # (bad manifest, unresolvable lockfile). Say so explicitly rather
+            # than reporting a bare exit code.
+            if ! grep -qE '^[^ ]+\.rs:[0-9]+:[0-9]+: error' clippy.log; then
+              echo "::error title=clippy::clippy failed with no Rust diagnostic; cargo itself could not complete. First 20 lines follow."
+              head -20 clippy.log
+            fi
           fi
           exit "$status"
 
