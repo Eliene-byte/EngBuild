@@ -905,6 +905,10 @@ mod tests {
     use cad_core::Vec3;
     use cad_geom::curve::Circle;
 
+    /// A document with one circle centred on the origin, radius 10.
+    ///
+    /// The centre is the origin, so a test that wants to see a transform must
+    /// either check the *extents* (x in [-10, 10]) or build its own fixture.
     fn doc_with_circle() -> (Document, EntityId) {
         let mut doc = Document::new();
         let layer = doc.layers.ensure_default();

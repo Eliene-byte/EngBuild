@@ -80,15 +80,44 @@ jobs:
             > clippy.log 2>&1 || status=$?
           cat clippy.log
           if [ "$status" -ne 0 ]; then
+            echo "::error title=clippy::clippy failed; the diagnostics follow."
+            # One annotation per diagnostic line, so the check run shows the
+            # actual lint rather than just an exit code.
+            grep -E '^(error|warning)' clippy.log | head -40 | while IFS= read -r line; do
+              clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
+              echo "::error title=clippy::$clean"
+            done
+          fi
+          exit "$status"
+
+      - name: Upload lint log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: clippy-log
+          path: clippy.log
+          if-no-files-found: ignore
+
+      # No GPU in CI, so the headless tests must not need one.
+      # Same log-to-annotation treatment as clippy: `cargo test` failures are
+      # otherwise just an exit code, because test output goes to stdout and
+      # panics are not rustc diagnostics.
+      - name: Test
+        run: |
+          status=0
+          cargo test --workspace -j 2 --no-fail-fast > test.log 2>&1 || status=$?
+          cat test.log
+          if [ "$status" -ne 0 ]; then
             echo "::error title=test-summary::tests failed; the failing cases follow."
 
             # GitHub deduplicates annotations by message, so emitting one
-            # annotation per test name and another per panic line collapses every
-            # failure into one unreadable entry. Emit a single annotation per
-            # failing test, carrying its own panic message.
+            # annotation for the test name and another for the panic collapses
+            # every failure into a handful of entries that show the names but not
+            # the assertions. Emit one annotation per failing test, carrying its
+            # own panic message.
             #
-            # `cargo test` prints `---- name stdout ----` first and the panic
-            # after it, so awk holds the name until it sees the panic.
+            # `cargo test` prints `---- name stdout ----` before the panic, so awk
+            # holds the name until it sees the panic that belongs to it.
             awk '
               function flush() {
                 if (pending != "" && msg != "") {
@@ -113,42 +142,6 @@ jobs:
               }
               END { flush() }
             ' test.log
-          fi
-          exit "$status"
-
-      - name: Upload lint log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: clippy-log
-          path: clippy.log
-          if-no-files-found: ignore
-
-      # No GPU in CI, so the headless tests must not need one.
-      # Same log-to-annotation treatment as clippy: `cargo test` failures are
-      # otherwise just an exit code, because test output goes to stdout and
-      # panics are not rustc diagnostics.
-      - name: Test
-        run: |
-          status=0
-          cargo test --workspace -j 2 --no-fail-fast > test.log 2>&1 || status=$?
-          cat test.log
-          if [ "$status" -ne 0 ]; then
-            echo "::error title=test-summary::tests failed; see the failing cases below."
-            # The failing test names, then the panic messages, which are indented
-            # and carry the actual assertion.
-            grep -E '^(test .*(FAILED|panicked)|failures:|error(\[|:))' test.log \
-              | head -40 | while IFS= read -r line; do
-                echo "::error title=test::$line"
-              done
-            grep -E '^ +thread .* panicked at |^ +assertion|left:|right:' test.log \
-              | head -40 | while IFS= read -r line; do
-                echo "::error title=test-panic::$line"
-              done
-            tail -n 30 test.log | while IFS= read -r line; do
-              clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
-              echo "::error title=test-log::$clean"
-            done
           fi
           exit "$status"
 
