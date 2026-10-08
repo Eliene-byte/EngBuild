@@ -387,16 +387,22 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_nibble_drops_the_stroke_from_there_on() {
-        // The conv won't happen, so only points before the bad one are kept --
-        // and the stroke is still emitted, with a truncated count the caller
-        // sees as fewer live points. What matters is that nothing panics.
+    fn a_bad_nibble_drops_the_whole_stroke() {
+        // Half an icon is worse than none: a truncated glyph reads as a bug in
+        // the font, whereas a missing one reads as a missing icon. Only the
+        // healthy stroke survives.
         let p = decode(Icon {
+            name: "bad",
+            data: "0F0G,84E6",
+        });
+        assert_eq!(p.len(), 1, "the broken stroke must be skipped: {p:?}");
+        assert_eq!(p[0][0], (8.0, 4.0));
+        assert_eq!(p[0][1], (14.0, 6.0));
+        let none = decode(Icon {
             name: "bad",
             data: "0F0G",
         });
-        assert_eq!(p.len(), 1);
-        assert_eq!(p[0][0], (0.0, 15.0));
+        assert!(none.is_empty(), "nothing survives a fully broken stroke");
     }
 
     #[test]
