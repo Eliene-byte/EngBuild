@@ -1195,6 +1195,139 @@ impl Entity {
         out
     }
 
+    /// The definition points of this entity, in order.
+    ///
+    /// These are the "grips" the constraint solver works on: moving them and
+    /// rebuilding the entity from them is how a sketch is solved without giving
+    /// every tool its own projection code. Entities with no 2D definition
+    /// (solids, meshes, unknown kinds) report nothing, and the solver leaves
+    /// them alone rather than inventing points for them.
+    pub fn anchor_points(&self) -> Vec<Vec2> {
+        match &self.entity {
+            EntityKind::Line(l) => vec![l.p0, l.p1],
+            EntityKind::Circle(c) => vec![c.center, c.center + Vec2::new(c.radius, 0.0)],
+            EntityKind::Arc(a) => vec![a.center, a.start_point(), a.end_point()],
+            EntityKind::Ellipse(e) => vec![e.center, e.center + e.major_axis],
+            EntityKind::Polyline(p) | EntityKind::Region(p) => p.vertices.clone(),
+            EntityKind::Spline(s) => s.control_points.clone(),
+            EntityKind::Point(p) => vec![p.position.xy()],
+            EntityKind::Text(t) => vec![t.insert.xy()],
+            EntityKind::Dimension(d) => vec![d.p1, d.p2],
+            EntityKind::Construction(c) => vec![c.from.xy(), c.to.xy()],
+            EntityKind::Insert(i) => vec![i.position.xy()],
+            EntityKind::Hatch(h) => h
+                .loops
+                .first()
+                .map(|l| l.vertices.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Rebuild this entity from solved anchor points.
+    ///
+    /// Returns `None` when `points` does not describe this kind (wrong count) or
+    /// when the kind has no anchors at all. A `None` means "leave it", never
+    /// "guess": a solver that rewrites geometry it does not understand is how
+    /// drawings get quietly corrupted.
+    pub fn with_anchor_points(&self, points: &[Vec2]) -> Option<Entity> {
+        let mut out = self.clone();
+        match &mut out.entity {
+            EntityKind::Line(l) => {
+                let [a, b] = points else { return None };
+                l.p0 = *a;
+                l.p1 = *b;
+            }
+            EntityKind::Circle(c) => {
+                let [centre, edge] = points else { return None };
+                c.center = *centre;
+                c.radius = centre.distance(*edge).max(1e-6);
+            }
+            EntityKind::Arc(a) => {
+                let [centre, s, e] = points else { return None };
+                a.center = *centre;
+                a.radius = centre.distance(*s).max(1e-6);
+                a.start_angle = (*s - *centre).y.atan2((*s - *centre).x);
+                let end = (*e - *centre).y.atan2((*e - *centre).x);
+                let mut sweep = end - a.start_angle;
+                while sweep <= 0.0 {
+                    sweep += std::f32::consts::TAU;
+                }
+                a.sweep = sweep;
+            }
+            EntityKind::Ellipse(e) => {
+                let [centre, major] = points else { return None };
+                e.center = *centre;
+                e.major_axis = *major - *centre;
+            }
+            EntityKind::Polyline(p) | EntityKind::Region(p) => {
+                if points.len() != p.vertices.len() || points.is_empty() {
+                    return None;
+                }
+                p.vertices = points.to_vec();
+            }
+            EntityKind::Spline(s) => {
+                if points.len() != s.control_points.len() || points.is_empty() {
+                    return None;
+                }
+                s.control_points = points.to_vec();
+                // The evaluated segments follow the control points, so they are
+                // rebuilt as straight runs rather than kept stale. A solved
+                // spline is a polyline through its new controls until it is
+                // re-fitted, which is honest: the old curvature belonged to the
+                // old points.
+                let lerp = |a: Vec2, b: Vec2, t: f32| a + (b - a) * t;
+                s.segments = s
+                    .control_points
+                    .windows(2)
+                    .map(|w| {
+                        cad_geom::spline::Bezier::new(
+                            w[0],
+                            lerp(w[0], w[1], 1.0 / 3.0),
+                            lerp(w[0], w[1], 2.0 / 3.0),
+                            w[1],
+                        )
+                    })
+                    .collect();
+            }
+            EntityKind::Point(p) => {
+                let [q] = points else { return None };
+                p.position = Vec3::new(q.x, q.y, p.position.z);
+            }
+            EntityKind::Text(t) => {
+                let [q] = points else { return None };
+                t.insert = Vec3::new(q.x, q.y, t.insert.z);
+            }
+            EntityKind::Dimension(d) => {
+                let [a, b] = points else { return None };
+                // The dimension line travels with the measured points: an
+                // associative dimension keeps measuring after a solve.
+                let delta = (*a - d.p1 + (*b - d.p2)) * 0.5;
+                d.line += delta;
+                d.p1 = *a;
+                d.p2 = *b;
+            }
+            EntityKind::Construction(c) => {
+                let [a, b] = points else { return None };
+                c.from = Vec3::new(a.x, a.y, c.from.z);
+                c.to = Vec3::new(b.x, b.y, c.to.z);
+            }
+            EntityKind::Insert(i) => {
+                let [q] = points else { return None };
+                i.position = Vec3::new(q.x, q.y, i.position.z);
+            }
+            EntityKind::Hatch(h) => {
+                let first = h.loops.first()?;
+                if points.len() != first.vertices.len() {
+                    return None;
+                }
+                h.loops.first_mut()?.vertices = points.to_vec();
+            }
+            _ => return None,
+        }
+        Some(out)
+    }
+
     /// The effective colour given the entity's own override and its layer.
     pub fn resolved_color(&self, layer_color: Rgba) -> Rgba {
         match self.common.color {
@@ -1471,6 +1604,56 @@ mod tests {
                 );
                 assert!(g.center.x.abs() < 1e-5);
             }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn anchors_cover_every_solvable_kind() {
+        let c = Circle::new(Vec2::new(1.0, 2.0), 3.0);
+        let e = Entity::circle(c);
+        assert_eq!(e.anchor_points().len(), 2);
+        // Round trip: rebuild from the anchors and get the same entity back.
+        let back = e
+            .with_anchor_points(&e.anchor_points())
+            .expect("round trip");
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn anchors_rebuild_a_circle_from_moved_points() {
+        let e = Entity::circle(Circle::new(Vec2::ZERO, 2.0));
+        let back = e
+            .with_anchor_points(&[Vec2::new(4.0, 0.0), Vec2::new(7.0, 0.0)])
+            .expect("rebuild");
+        match &back.entity {
+            EntityKind::Circle(c) => {
+                assert!(c.center.distance(Vec2::new(4.0, 0.0)) < 1e-5);
+                assert!((c.radius - 3.0).abs() < 1e-5);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn anchors_refuse_the_wrong_count() {
+        let e = Entity::line(Line::new(Vec2::ZERO, Vec2::X));
+        assert!(e.with_anchor_points(&[Vec2::ZERO]).is_none());
+        assert!(e.with_anchor_points(&[]).is_none());
+        // Solids have no anchors, so the solver leaves them alone.
+        let s = Entity::solid(Box3d::new(Vec3::ZERO, Vec3::splat(1.0)));
+        assert!(s.anchor_points().is_empty());
+        assert!(s.with_anchor_points(&[Vec2::ZERO]).is_none());
+    }
+
+    #[test]
+    fn anchors_follow_a_polyline_move() {
+        let e = Entity::polyline(Polyline::new(vec![Vec2::ZERO, Vec2::new(4.0, 3.0)], false));
+        let mut anchors = e.anchor_points();
+        anchors[1] = Vec2::new(8.0, 3.0);
+        let back = e.with_anchor_points(&anchors).expect("rebuild");
+        match &back.entity {
+            EntityKind::Polyline(p) => assert_eq!(p.vertices[1], Vec2::new(8.0, 3.0)),
             _ => panic!(),
         }
     }

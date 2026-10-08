@@ -420,6 +420,48 @@ impl CommandRegistry {
             Command::new("about", "About", "Help", "Version and licence information.")
                 .menu(&["Help", "About"]),
         );
+
+        // Constraints
+        self.register(
+            Command::new(
+                "coincident",
+                "Coincident",
+                "Constraints",
+                "Join the nearest points of two objects.",
+            )
+            .menu(&["Modify", "Coincident"]),
+        );
+        self.register(
+            Command::new(
+                "horizontal",
+                "Horizontal",
+                "Constraints",
+                "Level the nearest points of two objects.",
+            )
+            .menu(&["Modify", "Horizontal"]),
+        );
+        self.register(
+            Command::new(
+                "vertical",
+                "Vertical",
+                "Constraints",
+                "Plumb the nearest points of two objects.",
+            )
+            .menu(&["Modify", "Vertical"]),
+        );
+        self.register(
+            Command::new(
+                "distance",
+                "Distance",
+                "Constraints",
+                "Fix the distance between two objects: DISTANCE <length>.",
+            )
+            .menu(&["Modify", "Distance"]),
+        );
+        self.register(
+            Command::new("fix", "Fix", "Constraints", "Pin the selection in place.")
+                .menu(&["Modify", "Fix"]),
+        );
         // The command line doubles as a calculator, so "=" needs somewhere to
         // put the answer. It is a real command rather than a special case in the
         // parser: that way it shows up in `help` and can be scripted like any

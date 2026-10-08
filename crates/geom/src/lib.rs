@@ -6,6 +6,7 @@
 //! kernel that "almost" intersects is a CAD kernel you cannot trust.
 
 pub mod bulge;
+pub mod constraint;
 pub mod curve;
 pub mod intersect;
 pub mod spline;

@@ -151,6 +151,12 @@ pub struct Session {
     pub dark: bool,
     /// Time accumulator, for animated UI.
     pub time: f32,
+    /// The sketch constraints, in the order they were added.
+    ///
+    /// Stored on the session rather than the document because they are a
+    /// working state, not drawing content: saving a file saves the geometry,
+    /// not the relationships that produced it.
+    pub constraints: cad_geom::constraint::Problem,
     /// The last commands run, oldest first, capped.
     ///
     /// This is the model's context. It is deliberately capped: a CAD session can
@@ -163,6 +169,49 @@ pub struct Session {
 
 /// How many commands of context the model is given.
 const COMMAND_LOG_CAP: usize = 8;
+
+/// Which constraint the user asked for.
+///
+/// Separate from the solver's `Constraint` because the solver needs point
+/// indices and the user has a selection: translating one to the other is the
+/// session's job, and conflating them is how a UI concept leaks into the math.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintKind {
+    Coincident,
+    Horizontal,
+    Vertical,
+    Distance,
+    Fix,
+}
+
+impl ConstraintKind {
+    pub fn command(self) -> &'static str {
+        match self {
+            ConstraintKind::Coincident => "coincident",
+            ConstraintKind::Horizontal => "horizontal",
+            ConstraintKind::Vertical => "vertical",
+            ConstraintKind::Distance => "distance",
+            ConstraintKind::Fix => "fix",
+        }
+    }
+
+    pub fn from_command(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "coincident" | "coinc" => ConstraintKind::Coincident,
+            "horizontal" | "horiz" => ConstraintKind::Horizontal,
+            "vertical" | "vert" => ConstraintKind::Vertical,
+            "distance" | "dist" => ConstraintKind::Distance,
+            "fix" => ConstraintKind::Fix,
+            _ => return None,
+        })
+    }
+}
+
+/// A residual formatted the way the drawing reads it: three decimals and the
+/// drawing's own unit suffix, so "0.004mm" rather than "0.00428571".
+fn format_residual(r: f32, units: &cad_doc::Units) -> String {
+    format!("{:.3}{}", r, units.suffix())
+}
 
 impl Default for Session {
     fn default() -> Self {
@@ -190,8 +239,11 @@ impl Session {
             time: 0.0,
             command_log: Vec::new(),
             predictor: None,
+            constraints: cad_geom::constraint::Problem::new(),
         }
     }
+
+    // ------------------------------------------------------- constraints
 
     // ----------------------------------------------------------- suggestions
 
@@ -308,6 +360,161 @@ impl Session {
             .take(n)
             .map(|s| s.as_str())
             .collect()
+    }
+
+    // ------------------------------------------------------------ constraints
+
+    /// Add a constraint between the selection's anchor points and solve.
+    ///
+    /// The two entities contribute their anchor points, the constraint is built
+    /// between the named grips, and the whole sketch is solved as one undo step.
+    /// A solve that does not converge still applies: a partially-solved sketch
+    /// is closer than an unsolved one, and the status bar says how far off it
+    /// is rather than pretending it worked.
+    pub fn constrain(&mut self, kind: ConstraintKind, value: Option<f32>) -> CommandResult {
+        if self.tool.selection.len() < 2 {
+            self.status = StatusMessage::error("Select two objects to constrain");
+            return CommandResult::Unavailable;
+        }
+        let ids: Vec<EntityId> = self.tool.selection.iter().take(2).cloned().collect();
+        let anchors: Vec<Vec<cad_core::Vec2>> = ids
+            .iter()
+            .filter_map(|id| self.doc.entities.get(*id))
+            .map(|e| e.anchor_points())
+            .collect();
+        if anchors.len() < 2 || anchors[0].is_empty() || anchors[1].is_empty() {
+            self.status = StatusMessage::error("Those objects have no points to constrain");
+            return CommandResult::Unavailable;
+        }
+        // The grips are the closest pair of anchor points: constraining "these
+        // two objects" means the points the user can see touching, not an
+        // arbitrary first vertex.
+        let (mut ai, mut bi) = (0usize, 0usize);
+        let mut best = f32::INFINITY;
+        for (i, a) in anchors[0].iter().enumerate() {
+            for (j, b) in anchors[1].iter().enumerate() {
+                let d = a.distance(*b);
+                if d < best {
+                    best = d;
+                    ai = i;
+                    bi = j;
+                }
+            }
+        }
+        // World indices: entity 0 owns 0..n0, entity 1 owns n0...
+        let n0 = anchors[0].len();
+        let mut points = anchors[0].clone();
+        points.extend_from_slice(&anchors[1]);
+        let mut problem = self.constraints.clone();
+        let constraint = match kind {
+            ConstraintKind::Coincident => {
+                cad_geom::constraint::Constraint::Coincident { a: ai, b: n0 + bi }
+            }
+            ConstraintKind::Horizontal => {
+                cad_geom::constraint::Constraint::Horizontal { a: ai, b: n0 + bi }
+            }
+            ConstraintKind::Vertical => {
+                cad_geom::constraint::Constraint::Vertical { a: ai, b: n0 + bi }
+            }
+            ConstraintKind::Distance => {
+                let Some(d) = value.filter(|d| *d > 0.0) else {
+                    self.status = StatusMessage::error("DISTANCE needs a positive length");
+                    return CommandResult::Error("bad distance".into());
+                };
+                cad_geom::constraint::Constraint::Distance {
+                    a: ai,
+                    b: n0 + bi,
+                    distance: d,
+                }
+            }
+            ConstraintKind::Fix => {
+                // Fix pins every anchor of the selection, not just two points.
+                let mut problem = self.constraints.clone();
+                for id in &self.tool.selection {
+                    if let Some(e) = self.doc.entities.get(*id) {
+                        let base = points.len();
+                        let anchors = e.anchor_points();
+                        points.extend_from_slice(&anchors);
+                        for k in 0..anchors.len() {
+                            problem.add(cad_geom::constraint::Constraint::Fix { point: base + k });
+                        }
+                    }
+                }
+                return self.apply_constraints(problem, points, vec![ids.clone()]);
+            }
+        };
+        problem.add(constraint);
+        self.apply_constraints(problem, points, vec![ids])
+    }
+
+    /// Solve `problem` over `points` and write the result back as one undo step.
+    ///
+    /// `groups` maps point ranges back to entities: each entry is the entity ids
+    /// whose anchors occupy one contiguous run of `points`, in order.
+    fn apply_constraints(
+        &mut self,
+        problem: cad_geom::constraint::Problem,
+        mut points: Vec<cad_core::Vec2>,
+        groups: Vec<Vec<EntityId>>,
+    ) -> CommandResult {
+        let fixed = vec![false; points.len()];
+        let report = cad_geom::constraint::solve(&problem, &mut points, &fixed, 1e-3, 200);
+        // Split the solved points back across the entities they came from.
+        let mut offset = 0usize;
+        let mut rebuilt: Vec<(EntityId, cad_doc::Entity)> = Vec::new();
+        for ids in &groups {
+            for id in ids {
+                let Some(e) = self.doc.entities.get(*id) else {
+                    continue;
+                };
+                let n = e.anchor_points().len();
+                if points.len() < offset + n {
+                    continue;
+                }
+                if let Some(next) = e.with_anchor_points(&points[offset..offset + n]) {
+                    rebuilt.push((*id, next));
+                }
+                offset += n;
+            }
+        }
+        if rebuilt.is_empty() {
+            self.status = StatusMessage::error("Nothing to solve");
+            return CommandResult::Unavailable;
+        }
+        let label = format!(
+            "Constraint ({} left)",
+            format_residual(report.residual, &self.doc.units)
+        );
+        let mut history = std::mem::take(&mut self.history);
+        {
+            let mut tx = history.begin(&mut self.doc.entities, &label);
+            for (id, e) in &rebuilt {
+                tx.replace(*id, e.clone());
+            }
+            tx.commit();
+        }
+        self.history = history;
+        self.constraints = problem;
+        self.doc.invalidate_extents();
+        self.dirty = true;
+        self.status = if report.converged {
+            StatusMessage::success(format!("Constrained ({})", rebuilt.len()))
+        } else {
+            StatusMessage::info(format!(
+                "Constrained, off by {}",
+                format_residual(report.residual, &self.doc.units)
+            ))
+        };
+        CommandResult::Ok
+    }
+
+    /// Drop every constraint. The geometry stays where the solver left it;
+    /// constraints are relationships, not history.
+    pub fn clear_constraints(&mut self) -> CommandResult {
+        let n = self.constraints.len();
+        self.constraints = cad_geom::constraint::Problem::new();
+        self.status = StatusMessage::info(format!("{n} constraints cleared"));
+        CommandResult::Ok
     }
 
     // ------------------------------------------------------------- navigation
@@ -951,6 +1158,18 @@ impl Session {
                 self.insert_block(id, at, 0.0, 1.0)
             }
             "explode" | "x" => self.explode_selection(),
+            "coincident" | "coinc" => self.constrain(ConstraintKind::Coincident, None),
+            "horizontal" | "horiz" => self.constrain(ConstraintKind::Horizontal, None),
+            "vertical" | "vert" => self.constrain(ConstraintKind::Vertical, None),
+            "distance" | "dist" => match arg.parse::<f32>() {
+                Ok(d) if d > 0.0 => self.constrain(ConstraintKind::Distance, Some(d)),
+                _ => {
+                    self.status = StatusMessage::prompt("Type DISTANCE <length>");
+                    CommandResult::Unavailable
+                }
+            },
+            "fix" => self.constrain(ConstraintKind::Fix, None),
+            "unconstrain" | "clearconstraints" => self.clear_constraints(),
             "dimlinear" | "dimlin" | "dimaligned" | "dimali" | "dimradius" | "dimrad"
             | "dimdiameter" | "dimdia" | "dimangular" | "dimang" => {
                 // Every dimension kind shares the same two-point sequence; only
@@ -2211,6 +2430,146 @@ mod tests {
             CommandResult::Unavailable
         );
         assert!(s.command_log.is_empty());
+    }
+
+    // ------------------------------------------------------------ constraints
+
+    fn line_doc(a: Vec2, b: Vec2) -> (Document, EntityId) {
+        let mut doc = Document::new();
+        let layer = doc.layers.ensure_default();
+        let id = doc.add(cad_doc::Entity::line(cad_geom::curve::Line::new(a, b)).with_layer(layer));
+        (doc, id)
+    }
+
+    #[test]
+    fn coincident_joins_two_lines() {
+        let (mut doc_a, _) = line_doc(Vec2::ZERO, Vec2::new(10.0, 0.0));
+        let (doc_b, _) = line_doc(Vec2::new(12.0, 0.5), Vec2::new(22.0, 0.5));
+        for e in doc_b.entities.iter() {
+            doc_a.add(e.clone());
+        }
+        let mut s = Session::new();
+        s.doc = doc_a;
+        s.tool.selection = s.doc.entities.handles();
+        assert!(s.constrain(ConstraintKind::Coincident, None).is_ok());
+        // The nearest pair was (10,0) and (12,0.5): they now coincide.
+        let ends: Vec<Vec2> = s
+            .doc
+            .entities
+            .iter()
+            .flat_map(|e| e.anchor_points())
+            .collect();
+        let mut gap = f32::INFINITY;
+        for (i, a) in ends.iter().enumerate() {
+            for b in ends.iter().skip(i + 1) {
+                gap = gap.min(a.distance(*b));
+            }
+        }
+        assert!(gap < 1e-2, "nearest points did not meet: {ends:?}");
+        assert!(s.history.can_undo(), "a constraint must be one undo step");
+        assert_eq!(s.constraints.len(), 1);
+    }
+
+    #[test]
+    fn distance_sets_the_gap_between_two_points() {
+        let (mut doc_a, _) = line_doc(Vec2::ZERO, Vec2::new(2.0, 0.0));
+        let (doc_b, _) = line_doc(Vec2::new(10.0, 0.0), Vec2::new(12.0, 0.0));
+        for e in doc_b.entities.iter() {
+            doc_a.add(e.clone());
+        }
+        let mut s = Session::new();
+        s.doc = doc_a;
+        s.tool.selection = s.doc.entities.handles();
+        assert!(s.constrain(ConstraintKind::Distance, Some(5.0)).is_ok());
+        let ends: Vec<Vec2> = s
+            .doc
+            .entities
+            .iter()
+            .flat_map(|e| e.anchor_points())
+            .collect();
+        // The two lines' nearest ends were 8 apart; now the constrained pair is 5.
+        let mut found = false;
+        for (i, a) in ends.iter().enumerate() {
+            for b in ends.iter().skip(i + 1) {
+                if (a.distance(*b) - 5.0).abs() < 5e-2 {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "no pair at distance 5: {ends:?}");
+    }
+
+    #[test]
+    fn distance_without_a_length_is_rejected() {
+        let (doc_a, _) = line_doc(Vec2::ZERO, Vec2::new(2.0, 0.0));
+        let mut s = Session::new();
+        s.doc = doc_a;
+        s.tool.selection = s.doc.entities.handles();
+        assert!(!s.constrain(ConstraintKind::Distance, None).is_ok());
+        assert!(!s.constrain(ConstraintKind::Distance, Some(-1.0)).is_ok());
+        assert!(s.constraints.is_empty());
+    }
+
+    #[test]
+    fn constrain_needs_two_objects() {
+        let mut s = Session::new();
+        assert_eq!(
+            s.constrain(ConstraintKind::Coincident, None),
+            CommandResult::Unavailable
+        );
+    }
+
+    #[test]
+    fn constrain_is_undoable() {
+        let (mut doc_a, _) = line_doc(Vec2::ZERO, Vec2::new(10.0, 0.0));
+        let (doc_b, _) = line_doc(Vec2::new(30.0, 0.0), Vec2::new(40.0, 0.0));
+        for e in doc_b.entities.iter() {
+            doc_a.add(e.clone());
+        }
+        let mut s = Session::new();
+        s.doc = doc_a;
+        s.tool.selection = s.doc.entities.handles();
+        let before: Vec<Vec2> = s
+            .doc
+            .entities
+            .iter()
+            .flat_map(|e| e.anchor_points())
+            .collect();
+        assert!(s.constrain(ConstraintKind::Coincident, None).is_ok());
+        assert!(s.undo().is_ok());
+        let after: Vec<Vec2> = s
+            .doc
+            .entities
+            .iter()
+            .flat_map(|e| e.anchor_points())
+            .collect();
+        assert_eq!(before, after, "undo must restore the pre-solve geometry");
+    }
+
+    #[test]
+    fn fix_pins_the_selection() {
+        let (doc_a, _) = line_doc(Vec2::ZERO, Vec2::new(10.0, 0.0));
+        let mut s = Session::new();
+        s.doc = doc_a;
+        s.tool.selection = s.doc.entities.handles();
+        assert!(s.constrain(ConstraintKind::Fix, None).is_ok());
+        assert_eq!(s.constraints.len(), 2, "a line has two anchors");
+    }
+
+    #[test]
+    fn the_command_line_reaches_constraints() {
+        let (mut doc_a, _) = line_doc(Vec2::ZERO, Vec2::new(10.0, 0.0));
+        let (doc_b, _) = line_doc(Vec2::new(30.0, 0.0), Vec2::new(40.0, 0.0));
+        for e in doc_b.entities.iter() {
+            doc_a.add(e.clone());
+        }
+        let mut s = Session::new();
+        s.doc = doc_a;
+        s.tool.selection = s.doc.entities.handles();
+        assert!(s.run_command_line("coincident").is_ok());
+        assert!(s.run_command_line("distance 7").is_ok());
+        assert_eq!(s.constraints.len(), 2);
+        assert!(!s.run_command_line("distance").is_ok());
     }
 
     #[test]
