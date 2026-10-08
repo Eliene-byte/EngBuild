@@ -639,21 +639,19 @@ impl Tool {
         };
 
         if state_mode == ModifyMode::Mirror {
-            return match axis {
-                // The second click completes the axis; restore the state first so
-                // `commit_mirror` can take it.
-                Some(b) => {
-                    self.state = ToolState::Modify {
-                        ids,
-                        originals,
-                        base: Some(base),
-                        axis: Some(b),
-                        mode: state_mode,
-                    };
-                    self.commit_mirror(doc, base, b)
-                }
-                None => ToolOutcome::None,
+            // `axis` is only set by cursor motion; the click that finishes the
+            // axis is what defines it otherwise. Reading it from motion alone
+            // meant a mirror never applied without the pointer moving between
+            // the two clicks.
+            let end = axis.unwrap_or(world);
+            self.state = ToolState::Modify {
+                ids,
+                originals,
+                base: Some(base),
+                axis: Some(end),
+                mode: state_mode,
             };
+            return self.commit_mirror(doc, base, end);
         }
 
         let destination = world;
@@ -1246,11 +1244,13 @@ mod tests {
         let after = doc.entities.get(id).unwrap().bounds_2d().size().x
             * doc.entities.get(id).unwrap().bounds_2d().size().y;
         assert!((area - after).abs() < 1e-3, "{area} vs {after}");
-        // And it actually moved: mirrored across x = 0 the x range flips.
-        // (Measured on the bounding box rather than a signed area, which
+        // And it actually moved: a mirror about a line with direction X through
+        // the origin is a reflection in y, so the whole square lands below the
+        // axis. (Measured on the bounding box rather than a signed area, which
         // `Curve` does not expose.)
         let b = doc.entities.get(id).unwrap().bounds_2d();
-        assert!(b.max.x <= 0.0, "{b:?}");
+        assert!(b.max.y <= 0.0, "{b:?}");
+        assert!((b.min.x - 2.0).abs() < 1e-3, "x must be untouched: {b:?}");
     }
 
     #[test]
