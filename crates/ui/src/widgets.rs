@@ -724,24 +724,54 @@ mod tests {
     }
 
     #[test]
-    fn slider_clamps_to_range() {
+    fn slider_maps_the_track_onto_the_range() {
         let (mut i, mut b, mut v) = setup();
+        let r = rect();
+        // Press at the far right of the track: the mapping clamps at 1.0, so the
+        // value lands exactly on `max`. (The pointer has to stay over the track;
+        // `interact` requires hover before a press counts, which is what stops
+        // the knob following the cursor off the end of the rail.)
         i.push(
             &Event::MouseMoved {
-                pos: Vec2::new(9999.0, 20.0),
+                pos: Vec2::new(r.max.x, r.center().y),
             },
             0.0,
         );
         i.push(
             &Event::MouseDown {
-                pos: Vec2::new(9999.0, 20.0),
+                pos: Vec2::new(r.max.x, r.center().y),
+                button: MouseButton::Left,
+            },
+            0.1,
+        );
+        {
+            let mut u = ui(&mut i, &mut b, &mut v);
+            let (_, value) = u.slider(r, 0.0, 0.0, 100.0);
+            assert!((value - 100.0).abs() < 1e-3, "value={value}");
+        }
+        i.end_frame();
+    }
+
+    #[test]
+    fn slider_maps_the_left_edge_to_the_minimum() {
+        let (mut i, mut b, mut v) = setup();
+        let r = rect();
+        i.push(
+            &Event::MouseMoved {
+                pos: Vec2::new(r.min.x, r.center().y),
+            },
+            0.0,
+        );
+        i.push(
+            &Event::MouseDown {
+                pos: Vec2::new(r.min.x, r.center().y),
                 button: MouseButton::Left,
             },
             0.1,
         );
         let mut u = ui(&mut i, &mut b, &mut v);
-        let (_, value) = u.slider(rect(), 0.0, 0.0, 100.0);
-        assert!((value - 100.0).abs() < 1e-3, "value={value}");
+        let (_, value) = u.slider(r, 100.0, 0.0, 100.0);
+        assert!((value - 0.0).abs() < 1e-3, "value={value}");
     }
 
     #[test]
@@ -775,20 +805,30 @@ mod tests {
         }
         i.end_frame();
 
+        // Text and navigation are queued per category, not in arrival order, so
+        // they are delivered in separate frames -- which is what the event loop
+        // does anyway.
         i.push(&Event::Text("12.5".into()), 0.2);
+        {
+            let mut u = ui(&mut i, &mut b, &mut v);
+            let (_, changed) = u.text_field(rect(), &mut state, true);
+            assert!(changed, "typing must report a change");
+        }
+        assert_eq!(state.text, "12.5");
+        assert_eq!(state.cursor, 4, "the caret sits after the inserted text");
+        i.end_frame();
+
         i.push(
             &Event::KeyDown {
                 key: Key::Left,
                 mods: Modifiers::NONE,
             },
-            0.2,
+            0.3,
         );
         {
             let mut u = ui(&mut i, &mut b, &mut v);
-            let (_, changed) = u.text_field(rect(), &mut state, true);
-            assert!(changed);
+            u.text_field(rect(), &mut state, true);
         }
-        assert_eq!(state.text, "12.5");
         assert_eq!(state.cursor, 3, "left arrow must move the caret");
     }
 
