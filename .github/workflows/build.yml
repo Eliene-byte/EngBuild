@@ -288,6 +288,14 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p cad
 
+      - name: Upload smoke log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-log
+          path: smoke.log
+          if-no-files-found: ignore
+
       - name: Launch and confirm it stays up
         run: |
           # lavapipe is Mesa's software Vulkan driver, so this exercises the same
@@ -299,15 +307,27 @@ jobs:
           pid=$!
           sleep 25
 
+          report() {
+            # The log is the only evidence, and it has to travel as annotations
+            # to be readable outside the log viewer.
+            local why="$1"
+            echo "::error title=smoke::$why"
+            n=0
+            while IFS= read -r line && [ "$n" -lt 40 ]; do
+              local clean
+              clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
+              echo "::error title=smoke-log::$clean"
+              n=$((n + 1))
+            done < smoke.log
+          }
+
           if ! kill -0 "$pid" 2>/dev/null; then
-            echo "::error title=smoke::the app exited instead of opening a window"
-            cat smoke.log
+            report "the app exited instead of opening a window"
             exit 1
           fi
 
           if ! grep -q "cadkit: started on" smoke.log; then
-            echo "::error title=smoke::the process is alive but never reported a GPU"
-            cat smoke.log
+            report "the process is alive but never reported a GPU"
             kill "$pid" 2>/dev/null || true
             exit 1
           fi
