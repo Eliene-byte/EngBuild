@@ -296,6 +296,26 @@ pub const ICONS: &[Icon] = &[
         name: "zoomwindow",
         data: "111511,1151,EEEAEE,EEAE",
     },
+    Icon {
+        name: "coincident",
+        data: "58,B8,58B8",
+    },
+    Icon {
+        name: "horizontal",
+        data: "28E8,28,E8",
+    },
+    Icon {
+        name: "vertical",
+        data: "828E,82,E8",
+    },
+    Icon {
+        name: "distance",
+        data: "38D8,3335,D3D5",
+    },
+    Icon {
+        name: "fix",
+        data: "828C,46C6,3EDE",
+    },
 ];
 
 /// Look up an icon by name.

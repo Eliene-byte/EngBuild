@@ -117,6 +117,14 @@ const MODIFY_GROUP: &[(&str, &str, &str, &str)] = &[
     ("trash", "erase", "Erase", "E"),
 ];
 
+const CONSTRAINTS_GROUP: &[(&str, &str, &str, &str)] = &[
+    ("coincident", "coincident", "Coincide", ""),
+    ("horizontal", "horizontal", "Horiz", ""),
+    ("vertical", "vertical", "Vert", ""),
+    ("distance", "distance", "Dist", ""),
+    ("fix", "fix", "Fix", ""),
+];
+
 const VIEW_GROUP: &[(&str, &str, &str, &str)] = &[
     ("zoomall", "zoomall", "Zoom All", "Z"),
     ("zoomin", "zoomin", "Zoom In", ""),
@@ -166,6 +174,10 @@ impl RibbonTab {
                 RibbonGroup {
                     title: "Modify",
                     buttons: MODIFY_GROUP,
+                },
+                RibbonGroup {
+                    title: "Constraints",
+                    buttons: CONSTRAINTS_GROUP,
                 },
                 RibbonGroup {
                     title: "3D",
