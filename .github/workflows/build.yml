@@ -260,10 +260,67 @@ jobs:
           path: cadkit-macos-universal.tar.gz
           if-no-files-found: error
 
+  # ------------------------------------------------------------------ smoke test
+  # Every other job only proves the code compiles. This one actually launches the
+  # binary on a real (software) Vulkan stack under a virtual display, and fails
+  # if the window does not come up. Without it, "it compiles" and "it opens" are
+  # independent claims, and only one of them is ever tested.
+  smoke:
+    name: smoke (runs the app)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke
+
+      - name: Install software GPU and a virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mesa-vulkan-drivers libvulkan1 xvfb \
+            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev \
+            pkg-config
+
+      - name: Build
+        run: cargo build --release --locked -p cad
+
+      - name: Launch and confirm it stays up
+        run: |
+          # lavapipe is Mesa's software Vulkan driver, so this exercises the same
+          # wgpu code path a real GPU would, just slowly.
+          export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          export RUST_LOG=info
+
+          xvfb-run -a -s "-screen 0 1600x900x24" ./target/release/cad > smoke.log 2>&1 &
+          pid=$!
+          sleep 25
+
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "::error title=smoke::the app exited instead of opening a window"
+            cat smoke.log
+            exit 1
+          fi
+
+          if ! grep -q "cadkit: started on" smoke.log; then
+            echo "::error title=smoke::the process is alive but never reported a GPU"
+            cat smoke.log
+            kill "$pid" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "the app is running:"
+          cat smoke.log
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+
   # -------------------------------------------------------------------- release
   release:
     name: release
-    needs: [windows, windows-arm, linux, macos]
+    needs: [windows, windows-arm, linux, macos, smoke]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

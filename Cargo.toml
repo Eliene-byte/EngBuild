@@ -59,12 +59,17 @@ cad-gfx = { path = "crates/gfx" }
 cad-ui = { path = "crates/ui" }
 cad-app = { path = "crates/app" }
 
+# `gles` is not optional polish. Without it a machine with no Vulkan driver --
+# older Intel iGPU, many VMs, some laptops -- gets no adapter at all and the app
+# exits immediately with no window. GL ES via ANGLE/EGL is the fallback tier
+# that keeps those machines usable.
 wgpu = { version = "30.0", default-features = false, features = [
     "std",
     "wgsl",
     "dx12",
     "metal",
     "vulkan",
+    "gles",
 ] }
 
 # `rwh_06` is mandatory: wgpu 30 implements `SurfaceTarget` for anything that

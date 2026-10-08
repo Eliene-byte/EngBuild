@@ -973,11 +973,19 @@ fn create_window(elwt: &winit::event_loop::ActiveEventLoop, slot: &mut Option<Ap
             // Frame the (empty) document so the grid and axes are visible.
             app.session.viewport.cam2d.scale = 4.0;
             app.relayout();
+            // Announce a successful start on stderr. Without this, "the app did
+            // not open" and "the app opened and then failed silently" are
+            // indistinguishable from outside the machine; the CI smoke test
+            // greps for this line to prove the GPU came up.
+            eprintln!(
+                "cadkit: started on {:?} ({:?}, {:?})",
+                app.gpu.adapter_info.backend, app.gpu.adapter_info.name, app.gpu.format
+            );
             *slot = Some(app);
             true
         }
         Err(e) => {
-            eprintln!("could not initialise the GPU: {e}");
+            eprintln!("cadkit: could not initialise the GPU: {e}");
             elwt.exit();
             false
         }
