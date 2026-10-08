@@ -195,6 +195,39 @@ impl Session {
 
     // ----------------------------------------------------------- suggestions
 
+    /// Run an already-parsed intent.
+    ///
+    /// Split from [`Session::run_intent`] so a caller that parsed the line itself
+    /// -- as the unknown-command fallback does -- does not parse it twice.
+    pub fn apply_intent(&mut self, intent: cad_ai::Intent) -> CommandResult {
+        match &intent {
+            cad_ai::Intent::Command { name, args } => {
+                if name == "print" {
+                    self.status = StatusMessage::info(args.clone());
+                    return CommandResult::Ok;
+                }
+                let result = self.run_command_line_inner(name, args, &[]);
+                if result.is_ok() {
+                    self.log_command(&intent_command(&intent));
+                }
+                result
+            }
+            cad_ai::Intent::Geometry { kind, a, b } => {
+                let cmd = kind.command();
+                // Geometry needs the tool active before its points mean
+                // anything, so a failure here must not leave the points behind.
+                if !self.run_command_line_inner(cmd, "", &[]).is_ok() {
+                    return CommandResult::Unavailable;
+                }
+                self.click_world(cad_core::Vec2::new(a[0], a[1]), false);
+                self.click_world(cad_core::Vec2::new(b[0], b[1]), false);
+                self.log_command(cmd);
+                CommandResult::Ok
+            }
+            cad_ai::Intent::Unknown => CommandResult::Unavailable,
+        }
+    }
+
     /// Run a natural-language request.
     ///
     /// This is the path that makes the app usable without knowing its aliases:
@@ -203,29 +236,7 @@ impl Session {
     /// not recognise falls through to the command line, so a mistyped command is
     /// still a mistyped command and not a silent no-op.
     pub fn run_intent(&mut self, text: &str) -> CommandResult {
-        match cad_ai::parse(text) {
-            cad_ai::Intent::Command { name, args } => {
-                if name == "print" {
-                    self.status = StatusMessage::info(args);
-                    return CommandResult::Ok;
-                }
-                self.run_command_line_inner(&name, &args, &[])
-            }
-            cad_ai::Intent::Geometry { kind, a, b } => {
-                // Geometry needs the tool active and its points fed in, which is
-                // the same sequence a user would click through.
-                let cmd = kind.command();
-                // Geometry needs the tool active before its points mean
-                // anything, so a failure here must not leave the points behind.
-                if !self.run_command_line_inner(cmd, "", &[]).is_ok() {
-                    return CommandResult::Unavailable;
-                }
-                self.click_world(Vec2::new(a[0], a[1]), false);
-                self.click_world(Vec2::new(b[0], b[1]), false);
-                CommandResult::Ok
-            }
-            cad_ai::Intent::Unknown => CommandResult::Unavailable,
-        }
+        self.apply_intent(cad_ai::parse(text))
     }
 
     /// Record a command so the model can use it as context.
@@ -730,6 +741,11 @@ impl Session {
     /// `open plan.dxf` or `undo 3`. File commands take a path argument because
     /// there is no native file dialog: the user types it, and the error from a
     /// bad path comes back through the status bar rather than a modal.
+    ///
+    /// A line that is not a command is tried as a sentence: "zoom all" and
+    /// "draw a line from 0,0 to 10,10" both run, because the intent parser sees
+    /// the whole line. Known commands are still tried first, so a real command
+    /// always wins over an interpretation.
     pub fn run_command_line(&mut self, line: &str) -> CommandResult {
         let line = line.trim();
         if line.is_empty() {
@@ -740,11 +756,43 @@ impl Session {
         let name = head.to_ascii_lowercase();
         let arg = parts.next().unwrap_or("");
         let extra: Vec<&str> = parts.collect();
-        // `open a.dxf b.dxf` is a typo, not a request to ignore an argument.
-        if !extra.is_empty() && !matches!(name.as_str(), "undo" | "redo") {
+
+        // Only structured commands get the argument-count check. An unknown
+        // first word means the line might be a sentence, and a sentence with
+        // more than two words is the normal case, not a typo.
+        let structured = self.commands.get(&name).is_some()
+            || tool_for_command(&name).is_some()
+            || &name == "open"
+            || &name == "saveas"
+            || &name == "export"
+            || &name == "array"
+            || &name == "block"
+            || &name == "insert"
+            || &name == "explode"
+            || &name == "layer"
+            || &name == "help"
+            || &name == "about"
+            || &name == "selectall"
+            || &name == "all"
+            || &name == "new"
+            || &name == "undo"
+            || &name == "redo";
+        if structured
+            && !extra.is_empty()
+            && !matches!(
+                name.as_str(),
+                "undo" | "redo" | "array" | "insert" | "block" | "layer"
+            )
+        {
+            // `open a.dxf b.dxf` is a typo, not a request to ignore an argument.
             self.status =
                 StatusMessage::error(format!("{name} takes at most one argument: {line}"));
             return CommandResult::Error(format!("unexpected argument in `{line}`"));
+        }
+        if !structured {
+            // Not a command at all: let the intent parser see the whole line.
+            // `apply_intent` logs the canonical command when it runs.
+            return self.apply_intent(cad_ai::parse(line));
         }
 
         // Only a command that actually ran becomes context. Logging a typo would
@@ -944,8 +992,13 @@ impl Session {
                 if self.commands.get(other).is_some() || tool_for_command(other).is_some() {
                     self.activate(other)
                 } else {
-                    self.status = StatusMessage::error(format!("Unknown command: {other}"));
-                    CommandResult::Error(format!("Unknown command: {other}"))
+                    // Unreachable in practice: `run_command_line` only calls this
+                    // for structured commands, and anything else goes straight to
+                    // the intent parser. Kept as a guard so an inner caller that
+                    // passes a bare word still gets a real error.
+                    let msg = format!("Unknown command: {other}");
+                    self.status = StatusMessage::error(msg.clone());
+                    CommandResult::Error(msg)
                 }
             }
         }
@@ -954,10 +1007,17 @@ impl Session {
     /// Start an empty drawing.
     pub fn new_document(&mut self) {
         let theme = self.theme;
+        let dark = self.dark;
         let cam2d = self.viewport.cam2d;
         let canvas = self.viewport.canvas;
+        // The trained model survives: it cost milliseconds to build and it knows
+        // nothing about this drawing. The command log does not: it is this
+        // drawing's history, not the next one's.
+        let predictor = self.predictor.take();
         *self = Session::new();
         self.theme = theme;
+        self.dark = dark;
+        self.predictor = predictor;
         self.viewport.cam2d = cam2d;
         self.viewport.canvas = canvas;
         self.viewport.refresh_target();
@@ -1346,6 +1406,22 @@ fn explode_entity(
         }
     }
     out
+}
+
+/// The canonical command name an intent runs, for the command log.
+///
+/// `apply_intent` logs what actually ran rather than what was typed, so the
+/// model's context is "line" whether the user typed `L`, `line` or
+/// "draw a line".
+fn intent_command(intent: &cad_ai::Intent) -> String {
+    match intent {
+        cad_ai::Intent::Command { name, .. } => match tool_for_command(name) {
+            Some(t) => t.command().to_string(),
+            None => name.clone(),
+        },
+        cad_ai::Intent::Geometry { kind, .. } => kind.command().to_string(),
+        cad_ai::Intent::Unknown => String::new(),
+    }
 }
 
 /// File name for a status message: the last path component, so the message stays
@@ -2077,5 +2153,61 @@ mod tests {
         let mut s = Session::new();
         assert!(s.run_command_line("help").is_ok());
         assert!(s.status.text.contains("commands"), "{:?}", s.status.text);
+    }
+
+    #[test]
+    fn a_sentence_runs_through_the_command_line() {
+        // "zoom all" is not a command name; it is a sentence the intent parser
+        // resolves. The command line must hand it over, not reject it.
+        let mut s = Session::new();
+        assert!(s.run_command_line("zoom all").is_ok());
+        assert_eq!(s.recent_commands(1), vec!["zoomall"]);
+    }
+
+    #[test]
+    fn a_sentence_with_many_words_is_not_an_argument_error() {
+        // The argument-count check used to fire before the parser ever saw the
+        // line, so every sentence with more than two words was an error.
+        let mut s = Session::new();
+        s.viewport.cam2d = Camera2D::new(Vec2::new(800.0, 600.0));
+        assert!(s.run_command_line("draw a line from 0,0 to 10,10").is_ok());
+        assert_eq!(s.doc.entities.len(), 1);
+        assert_eq!(s.recent_commands(1), vec!["line"]);
+    }
+
+    #[test]
+    fn run_intent_draws_geometry() {
+        let mut s = Session::new();
+        s.viewport.cam2d = Camera2D::new(Vec2::new(800.0, 600.0));
+        assert!(s.run_intent("circle at 5,5 radius 3").is_ok());
+        assert_eq!(s.doc.entities.len(), 1);
+        match &s.doc.entities.iter().next().unwrap().entity {
+            cad_doc::EntityKind::Circle(c) => {
+                assert!(
+                    c.center.distance(Vec2::new(5.0, 5.0)) < 1e-3,
+                    "{:?}",
+                    c.center
+                );
+                assert!((c.radius - 3.0).abs() < 1e-3, "{}", c.radius);
+            }
+            other => panic!("expected a circle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_intent_reports_nonsense_as_unavailable() {
+        let mut s = Session::new();
+        assert_eq!(
+            s.run_intent("frobnicate the gizmo"),
+            CommandResult::Unavailable
+        );
+        assert!(s.command_log.is_empty());
+    }
+
+    #[test]
+    fn run_intent_calculates() {
+        let mut s = Session::new();
+        assert!(s.run_intent("= 5 + 3").is_ok());
+        assert_eq!(s.status.text, "8");
     }
 }
