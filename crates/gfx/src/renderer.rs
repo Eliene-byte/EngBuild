@@ -355,7 +355,12 @@ impl Gpu {
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
-                sample_count: 1,
+                // Must match the colour attachment's sample count. wgpu
+                // validates that every attachment in a pass agrees, so a 1-sample
+                // depth target beside a 4x MSAA colour target is a validation
+                // error -- it aborted the first frame on every machine, since
+                // MSAA is on by default.
+                sample_count: self.pipelines.msaa_samples,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Depth32Float,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
