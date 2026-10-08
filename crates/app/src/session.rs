@@ -792,7 +792,16 @@ impl Session {
         if !structured {
             // Not a command at all: let the intent parser see the whole line.
             // `apply_intent` logs the canonical command when it runs.
-            return self.apply_intent(cad_ai::parse(line));
+            return match self.apply_intent(cad_ai::parse(line)) {
+                CommandResult::Unavailable => {
+                    // Nothing understood it either. A mistyped command is an
+                    // error, not a quiet no-op: the user has to know it failed.
+                    let msg = format!("Unknown command: {line}");
+                    self.status = StatusMessage::error(msg.clone());
+                    CommandResult::Error(msg)
+                }
+                other => other,
+            };
         }
 
         // Only a command that actually ran becomes context. Logging a typo would
