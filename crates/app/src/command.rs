@@ -250,6 +250,24 @@ impl CommandRegistry {
             .menu(&["View", "Zoom Window"]),
         );
         self.register(
+            Command::new(
+                "pan",
+                "Pan",
+                "View",
+                "Drag the view with the middle button.",
+            )
+            .menu(&["View", "Pan"]),
+        );
+        // `select` is ToolId::Select's command name, so it has to exist in the
+        // registry or the tool is unreachable through the command table. It is
+        // the default tool, so it gets no menu entry or shortcut.
+        self.register(Command::new(
+            "select",
+            "Select",
+            "Tools",
+            "Click to pick, drag for a window selection.",
+        ));
+        self.register(
             Command::new("zoomin", "Zoom In", "View", "Zoom in one step.")
                 .menu(&["View", "Zoom In"]),
         );

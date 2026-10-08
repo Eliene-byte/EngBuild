@@ -416,7 +416,10 @@ impl Session {
     /// Apply a tool outcome to the document and status bar.
     pub fn apply_outcome(&mut self, outcome: ToolOutcome) {
         match outcome {
-            ToolOutcome::None => {}
+            // No outcome still means the tool moved: the first click of a line
+            // starts a rubber band and needs a redraw even though nothing in the
+            // document changed.
+            ToolOutcome::None => self.dirty = true,
             ToolOutcome::Changed(label) => {
                 self.doc.invalidate_extents();
                 self.dirty = true;
@@ -651,10 +654,13 @@ mod tests {
         let n = s.doc.entities.len();
         s.select_all();
         s.delete_selection();
-        assert!(s.redo().is_ok());
-        assert_eq!(s.doc.entities.len(), n);
+        assert_eq!(s.doc.entities.len(), n - 1, "delete removed one");
+        // Undo first: a fresh delete leaves the redo stack empty, so calling
+        // redo() here would correctly report "Nothing to redo".
         assert!(s.undo().is_ok());
-        assert_eq!(s.doc.entities.len(), n - 1);
+        assert_eq!(s.doc.entities.len(), n, "undo restored it");
+        assert!(s.redo().is_ok());
+        assert_eq!(s.doc.entities.len(), n - 1, "redo removed it again");
     }
 
     #[test]

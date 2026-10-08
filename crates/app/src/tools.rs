@@ -140,9 +140,11 @@ impl ToolState {
                         "Specify radius".into()
                     }
                 }
+                // Off by one: an arc needs three points, and the point just
+                // clicked is already in `points`, so len 1 is the start point.
                 ToolId::Arc => match points.len() {
-                    0 => "Specify start point".into(),
-                    1 => "Specify second point".into(),
+                    1 => "Specify start point".into(),
+                    2 => "Specify second point".into(),
                     _ => "Specify end point".into(),
                 },
                 ToolId::Polyline => format!("Specify next vertex ({})", points.len()),
