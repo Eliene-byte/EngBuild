@@ -327,7 +327,7 @@ jobs:
             local why="$1"
             echo "::error title=smoke::$why"
             n=0
-            while IFS= read -r line && [ "$n" -lt 40 ]; do
+            while IFS= read -r line && [ "$n" -lt 150 ]; do
               local clean
               clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
               echo "::error title=smoke-log::$clean"
