@@ -1229,7 +1229,7 @@ mod tests {
     #[test]
     fn layer_visibility_toggles_and_reports() {
         let mut s = Session::new();
-        let id = s.add_layer("hidden-me");
+        s.add_layer("hidden-me");
         let id = s.doc.current_layer();
         assert!(s.doc.layers.visible(id));
         s.toggle_layer_visibility(id);
