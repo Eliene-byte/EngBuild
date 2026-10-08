@@ -17,7 +17,7 @@
 
 use cad_core::{Vec2, Vec3};
 use cad_doc::Document;
-use cad_doc::entity::{Text, TextAlign};
+use cad_doc::entity::{Dimension, DimensionKind, Text, TextAlign};
 use cad_geom::curve::{Arc, Circle, Line, Polyline};
 use std::collections::HashMap;
 use std::fmt;
@@ -409,6 +409,24 @@ fn write_geometry(w: &mut W, k: &cad_doc::EntityKind, blocks: &HashMap<cad_doc::
             w.f32(i.row_spacing);
             w.f32(i.col_spacing);
         }
+        K::Dimension(d) => {
+            w.u32(17);
+            w.u32(d.kind as u32);
+            w.v2(d.p1);
+            w.v2(d.p2);
+            w.v2(d.line);
+            w.b(d.text_at.is_some());
+            if let Some(t) = d.text_at {
+                w.v2(t);
+            }
+            w.b(d.text_override.is_some());
+            if let Some(t) = &d.text_override {
+                w.str(t);
+            }
+            w.f32(d.height);
+            w.f32(d.arrow);
+            w.f32(d.extension_gap);
+        }
         K::Unknown { dxf_type, .. } => {
             w.u32(16);
             w.str(dxf_type);
@@ -770,6 +788,30 @@ fn read_entity(
                 dxf_type,
                 raw: Vec::new(),
             }
+        }
+        17 => {
+            let kind = match r.u32()? {
+                0 => DimensionKind::Linear,
+                1 => DimensionKind::Aligned,
+                2 => DimensionKind::Radius,
+                3 => DimensionKind::Diameter,
+                4 => DimensionKind::Angular,
+                other => {
+                    return Err(NativeError::Truncated(format!(
+                        "unknown dimension kind {other}"
+                    )));
+                }
+            };
+            let p1 = r.v2()?;
+            let p2 = r.v2()?;
+            let line = r.v2()?;
+            let mut d = Dimension::new(kind, p1, p2, line);
+            d.text_at = if r.b()? { Some(r.v2()?) } else { None };
+            d.text_override = if r.b()? { Some(r.str()?) } else { None };
+            d.height = r.f32()?;
+            d.arrow = r.f32()?;
+            d.extension_gap = r.f32()?;
+            K::Dimension(d)
         }
         other => K::Unknown {
             dxf_type: format!("tag{other}"),

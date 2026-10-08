@@ -7,6 +7,8 @@
 
 pub mod dxf;
 pub mod native;
+pub mod pdf;
 
 pub use dxf::{DxfError, DxfReadOptions, import, read, write};
 pub use native::{NativeError, load, save};
+pub use pdf::{Paper, PlotError, PlotOptions};

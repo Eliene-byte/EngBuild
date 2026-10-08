@@ -230,6 +230,212 @@ impl Hatch {
     }
 }
 
+/// Which dimension a [`Dimension`] measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DimensionKind {
+    /// Horizontal or vertical distance between two points, with the measurement
+    /// line parallel to the measured axis.
+    Linear,
+    /// True distance along the line joining the two points.
+    Aligned,
+    /// Distance from a centre to a point on a circle.
+    Radius,
+    /// Full width of a circle.
+    Diameter,
+    /// Angle between two directions. Stored in radians; [`Dimension::text`]
+    /// formats it in degrees, because that is what a drawing is read in.
+    Angular,
+}
+
+impl DimensionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DimensionKind::Linear => "LINEAR",
+            DimensionKind::Aligned => "ALIGNED",
+            DimensionKind::Radius => "RADIUS",
+            DimensionKind::Diameter => "DIAMETER",
+            DimensionKind::Angular => "ANGULAR",
+        }
+    }
+
+    /// Does this kind of dimension carry arrow heads?
+    ///
+    /// Architectural drafting uses ticks where mechanical uses arrows, so the
+    /// distinction is modelled rather than assumed; only the tick style is not
+    /// yet selectable.
+    pub fn has_arrows(self) -> bool {
+        true
+    }
+
+    /// The name a drawing uses in the command line, e.g. `DIMDIAMETER`.
+    pub fn command(self) -> &'static str {
+        match self {
+            DimensionKind::Linear => "dimlinear",
+            DimensionKind::Aligned => "dimaligned",
+            DimensionKind::Radius => "dimradius",
+            DimensionKind::Diameter => "dimdiameter",
+            DimensionKind::Angular => "dimangular",
+        }
+    }
+
+    pub fn from_command(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "dimlinear" | "dimlin" => DimensionKind::Linear,
+            "dimaligned" | "dimali" => DimensionKind::Aligned,
+            "dimradius" | "dimrad" => DimensionKind::Radius,
+            "dimdiameter" | "dimdia" => DimensionKind::Diameter,
+            "dimangular" | "dimang" => DimensionKind::Angular,
+            _ => return None,
+        })
+    }
+}
+
+/// An associative dimension.
+///
+/// "Associative" means the *measurement points* are stored, not the text, so the
+/// number is recomputed whenever the geometry moves. A dimension that stores a
+/// frozen string is the single most common way a drawing stops being a drawing,
+/// so the text here is derived on demand and [`Dimension::text_override`] is the
+/// only way to pin it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dimension {
+    pub kind: DimensionKind,
+    /// The two measurement points, in world space.
+    pub p1: Vec2,
+    pub p2: Vec2,
+    /// Where the dimension line is drawn: a point the line runs through for
+    /// linear kinds, and the tip of the leader for radial ones.
+    pub line: Vec2,
+    /// Where the text sits, once the user has placed it by hand.
+    pub text_at: Option<Vec2>,
+    /// Drawn instead of the computed measurement. `None` means "measure".
+    pub text_override: Option<String>,
+    /// Cap height of the text, in world units.
+    pub height: f32,
+    /// Arrow head length, in world units.
+    pub arrow: f32,
+    /// Gap between the measured point and the start of its extension line.
+    pub extension_gap: f32,
+}
+
+impl Dimension {
+    pub fn new(kind: DimensionKind, p1: Vec2, p2: Vec2, line: Vec2) -> Self {
+        Self {
+            kind,
+            p1,
+            p2,
+            line,
+            text_at: None,
+            text_override: None,
+            height: 2.5,
+            arrow: 1.5,
+            extension_gap: 0.5,
+        }
+    }
+
+    /// The measured value in drawing units.
+    ///
+    /// A linear dimension reads only the dominant axis; every other kind is a
+    /// true distance, except a diameter which is twice the radius.
+    pub fn measurement(&self) -> f32 {
+        match self.kind {
+            DimensionKind::Linear => {
+                let dx = (self.p2.x - self.p1.x).abs();
+                let dy = (self.p2.y - self.p1.y).abs();
+                dx.max(dy)
+            }
+            DimensionKind::Radius => self.p1.distance(self.p2),
+            DimensionKind::Diameter => 2.0 * self.p1.distance(self.p2),
+            _ => self.p1.distance(self.p2),
+        }
+    }
+
+    /// The measured angle in radians, for [`DimensionKind::Angular`].
+    pub fn angle(&self) -> f32 {
+        let a = (self.p1.y - self.line.y).atan2(self.p1.x - self.line.x);
+        let b = (self.p2.y - self.line.y).atan2(self.p2.x - self.line.x);
+        let mut d = (b - a).abs();
+        if d > std::f32::consts::PI {
+            d = std::f32::consts::TAU - d;
+        }
+        d
+    }
+
+    /// The string a drawing shows: the measurement, or the override.
+    ///
+    /// Formatting happens here rather than at creation time, so a dimension
+    /// whose geometry moved shows the new number without being rewritten.
+    pub fn text(&self, suffix: &str) -> String {
+        if let Some(t) = &self.text_override {
+            return t.clone();
+        }
+        match self.kind {
+            DimensionKind::Angular => {
+                format!("{:.2}\u{b0}{suffix}", self.angle().to_degrees())
+            }
+            DimensionKind::Radius => format!("R{:.3}{suffix}", self.measurement()),
+            DimensionKind::Diameter => format!("\u{2300}{:.3}{suffix}", self.measurement()),
+            _ => format!("{:.3}{suffix}", self.measurement()),
+        }
+    }
+
+    /// Where the text goes: where the user put it, or on the dimension line.
+    pub fn text_position(&self) -> Vec2 {
+        self.text_at.unwrap_or(self.line)
+    }
+
+    /// The four points the dimension is drawn from: the two measured points,
+    /// and the two points on the dimension line they project onto.
+    ///
+    /// For a radial dimension the leader runs from the centre out to the
+    /// measured point, so the same four-point shape draws it without a special
+    /// case in the renderer.
+    pub fn geometry(&self) -> (Vec2, Vec2, Vec2, Vec2) {
+        match self.kind {
+            DimensionKind::Linear | DimensionKind::Aligned => {
+                let u = (self.p2 - self.p1).normalize_or(Vec2::X);
+                let n = Vec2::new(-u.y, u.x);
+                // `line` is a point the dimension line runs through; its
+                // perpendicular distance from the measurement is the offset.
+                let offset = (self.line - self.p1).dot(n);
+                let a = self.p1 + n * offset;
+                let b = self.p2 + n * offset;
+                (self.p1, self.p2, a, b)
+            }
+            DimensionKind::Radius | DimensionKind::Diameter => {
+                (self.p1, self.p2, self.line, self.line + (self.p2 - self.p1))
+            }
+            // The vertex, then the two arms.
+            DimensionKind::Angular => (self.line, self.line, self.p1, self.p2),
+        }
+    }
+
+    /// The measured points in reading order.
+    ///
+    /// CAD reads left to right, so a dimension whose ends are the wrong way
+    /// round is corrected here rather than by the renderer special-casing it.
+    pub fn readable_ends(&self) -> (Vec2, Vec2) {
+        if self.p1.x <= self.p2.x {
+            (self.p1, self.p2)
+        } else {
+            (self.p2, self.p1)
+        }
+    }
+
+    /// The arrow head direction at each end: pointing back along the dimension
+    /// line, which is what makes an arrow head read as a direction.
+    pub fn arrow_dirs(&self) -> (Vec2, Vec2) {
+        let (_, _, a, b) = self.geometry();
+        let d = b - a;
+        if d.length_squared() < 1e-12 {
+            (Vec2::X, Vec2::X)
+        } else {
+            let u = d.normalize();
+            (-u, u)
+        }
+    }
+}
+
 /// The geometry payload of an entity.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntityKind {
@@ -252,6 +458,9 @@ pub enum EntityKind {
     Construction(Construction),
     /// A block reference.
     Insert(InsertRef),
+    /// An associative dimension: the measurement points are stored, not the
+    /// text, so the number follows the geometry.
+    Dimension(Dimension),
     /// Placeholder for entities we can draw but not yet round-trip.
     Unknown {
         dxf_type: String,
@@ -361,6 +570,7 @@ impl Entity {
             EntityKind::Face(_) => "FACE3D",
             EntityKind::Construction(_) => "XLINE",
             EntityKind::Insert(_) => "INSERT",
+            EntityKind::Dimension(_) => "DIMENSION",
             EntityKind::Unknown { dxf_type, .. } => dxf_type,
         }
     }
@@ -419,6 +629,10 @@ impl Entity {
                 Rect2::new(c.from.xy().min(c.to.xy()), c.from.xy().max(c.to.xy()))
             }
             EntityKind::Box(b) => Rect2::new(b.min.xy(), b.max.xy()),
+            EntityKind::Dimension(d) => {
+                let (a, b, c, e) = d.geometry();
+                Rect2::new(a, b).union(Rect2::new(c, e))
+            }
             EntityKind::Face(f) => {
                 let mut r = Rect2::ZERO;
                 let mut first = true;
@@ -472,6 +686,13 @@ impl Entity {
                     }
                 }
                 b
+            }
+            EntityKind::Dimension(d) => {
+                let (a, b, c, e) = d.geometry();
+                Aabb3::new(Vec3::new(a.x, a.y, 0.0), Vec3::new(b.x, b.y, 0.0)).union(Aabb3::new(
+                    Vec3::new(c.x, c.y, 0.0),
+                    Vec3::new(e.x, e.y, 0.0),
+                ))
             }
             EntityKind::Construction(c) => Aabb3::new(c.from, c.to),
             EntityKind::Point(p) => Aabb3::new(p.position, p.position),
@@ -548,15 +769,25 @@ impl Entity {
                 c.from += v;
                 c.to += v;
             }
+            EntityKind::Dimension(d) => {
+                // The measurement line travels with the geometry, so an
+                // associative dimension keeps measuring after a move.
+                d.p1 += v2;
+                d.p2 += v2;
+                d.line += v2;
+                if let Some(t) = d.text_at.as_mut() {
+                    *t += v2;
+                }
+            }
             EntityKind::Insert(i) => i.position += v,
             EntityKind::Mesh(m) => {
                 for p in &mut m.positions {
                     *p += v;
                 }
             }
-            // Everything with a 2D curve view returned through the
-            // `as_curve` branch above, so the remainder is the non-curve kinds
-            // plus `Unknown`, which has no geometry to mirror.
+            // Everything with a 2D curve view returns through the `as_curve`
+            // branch above, so the remainder is the non-curve kinds plus
+            // `Unknown`, which has no geometry to mirror.
             _ => {}
         }
         out
@@ -641,6 +872,16 @@ impl Entity {
                 let n = f.plane.n.rotate_z(angle);
                 let d = n.dot(f.loop_pts[0]);
                 f.plane = Plane3::new(n, d);
+            }
+            EntityKind::Dimension(d) => {
+                // A dimension measures the geometry it points at, so rotating
+                // the drawing has to carry its points round with it.
+                d.p1 = rot(d.p1);
+                d.p2 = rot(d.p2);
+                d.line = rot(d.line);
+                if let Some(t) = d.text_at.as_mut() {
+                    *t = rot(*t);
+                }
             }
             EntityKind::Point(_) | EntityKind::Mesh(_) | EntityKind::Unknown { .. } => {}
         }
@@ -822,6 +1063,7 @@ impl Entity {
             EntityKind::Face(_) => "Face",
             EntityKind::Construction(_) => "Construction",
             EntityKind::Insert(_) => "Insert",
+            EntityKind::Dimension(_) => "Dimension",
             EntityKind::Unknown { .. } => "Unknown",
         }
     }
@@ -841,6 +1083,7 @@ impl Entity {
             EntityKind::Arc(a) => Some((a.length() as f64, false)),
             EntityKind::Ellipse(e) => Some((e.perimeter_ramanujan() as f64, false)),
             EntityKind::Polyline(p) | EntityKind::Region(p) => Some((p.perimeter() as f64, false)),
+            EntityKind::Dimension(d) => Some((d.measurement() as f64, false)),
             EntityKind::Box(b) => Some((b.volume() as f64, true)),
             _ => None,
         }
@@ -861,6 +1104,7 @@ impl Entity {
                 v
             }
             EntityKind::Insert(i) => vec![i.position.xy()],
+            EntityKind::Dimension(d) => vec![d.p1, d.p2],
             _ => Vec::new(),
         }
     }

@@ -20,8 +20,8 @@ use cad_core::{Rect2, Vec3};
 
 pub use block::{Block, BlockRecord, BlockTable};
 pub use entity::{
-    Box3d, Construction, Entity, EntityCommon, EntityKind, Face3d, Hatch, InsertRef, Mesh3d,
-    PointEnt, Text, TextAlign,
+    Box3d, Construction, Dimension, DimensionKind, Entity, EntityCommon, EntityKind, Face3d, Hatch,
+    InsertRef, Mesh3d, PointEnt, Text, TextAlign,
 };
 pub use handle::{BlockId, EntityId, HandleTable, LayerId};
 pub use layer::{Layer, LayerTable, LineType, LineWeight};
