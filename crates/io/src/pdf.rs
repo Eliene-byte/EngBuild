@@ -877,14 +877,14 @@ mod tests {
         let xref = text.find("\nxref\n").expect("xref table");
         // Rows after `xref` and the `0 N` count: first the free entry for
         // object 0, then one per object, then the trailer.
-        let mut rows = text[xref..]
+        let rows = text[xref..]
             .lines()
             .skip(3)
             .skip_while(|l| l.contains("65535 f"));
-        let mut n = 1;
-        while let Some(row) = rows.next() {
-            // The first row that does not start with a ten-digit offset is the
-            // trailer, and `parse` failing is how that is detected.
+        // The first row that does not start with a ten-digit offset is the
+        // trailer, which is how the walk knows to stop.
+        let mut walked = 0usize;
+        for row in rows {
             let Some(off) = row
                 .split_whitespace()
                 .next()
@@ -892,14 +892,14 @@ mod tests {
             else {
                 break;
             };
+            walked += 1;
             assert!(
-                bytes[off..].starts_with(format!("{n} 0 obj").as_bytes()),
-                "xref entry {n} points at {:?}",
+                bytes[off..].starts_with(format!("{walked} 0 obj").as_bytes()),
+                "xref entry {walked} points at {:?}",
                 String::from_utf8_lossy(&bytes[off..(off + 24).min(bytes.len())])
             );
-            n += 1;
         }
-        assert!(n >= 7, "expected six objects, walked {n}");
+        assert!(walked >= 6, "expected six objects, walked {walked}");
 
         // The content stream's /Length must match its actual length, or a
         // strict reader rejects the file.

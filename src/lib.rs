@@ -813,7 +813,9 @@ fn draw_dimension(
 ) {
     let s = |w: Vec2| cam.world_to_screen(w) * dpr;
     let hair = 1.0 * dpr;
-    let (p1, p2, a, b) = d.geometry();
+    // Only the dimension-line points are needed here: the measured points are
+    // re-read through `readable_ends`, which puts them in left-to-right order.
+    let (_, _, a, b) = d.geometry();
     let dim = color.with_alpha(0.9);
 
     // Extension lines, from each measured point out to just past the dimension

@@ -81,12 +81,22 @@ jobs:
           cat clippy.log
           if [ "$status" -ne 0 ]; then
             echo "::error title=clippy::clippy failed; the diagnostics follow."
-            # One annotation per diagnostic line, so the check run shows the
-            # actual lint rather than just an exit code.
-            grep -E '^(error|warning)' clippy.log | head -40 | while IFS= read -r line; do
-              clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
-              echo "::error title=clippy::$clean"
-            done
+            # Skip the summary lines: `could not compile` and `build failed`
+            # are emitted by cargo, not by the compiler, and with a `head` cap
+            # they crowd out the actual diagnostic. With `--message-format=short`
+            # every real diagnostic is on one line beginning with a path.
+            grep -E '^[^ ].*: (error|warning)(\[|:)' clippy.log | head -40 \
+              | while IFS= read -r line; do
+                clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
+                echo "::error title=clippy::$clean"
+              done
+            # If the filter matched nothing, the log itself is the only evidence.
+            if ! grep -qE '^[^ ].*: (error|warning)(\[|:)' clippy.log; then
+              tail -n 20 clippy.log | while IFS= read -r line; do
+                clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
+                echo "::error title=clippy-log::$clean"
+              done
+            fi
           fi
           exit "$status"
 
