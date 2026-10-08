@@ -411,7 +411,10 @@ mod tests {
         // point is a dot, which is how every `select`-style icon ends.
         // A stroke of one point *is* legal (a dot), so "08" is not here; what
         // is here is anything that cannot be read as whole two-nibble points.
-        for bad in ["", "0", "0G", "08G4", "88,88,8", "0F0G", ","] {
+        // "88,88,8" is not here: its first two strokes are valid single points and
+        // its third is simply skipped, so it decodes to two dots. What is here
+        // is anything where *no* stroke survives.
+        for bad in ["", "0", "0G", "08G4", "0F0G", ",", "0,1"] {
             assert_eq!(
                 decode(Icon {
                     name: "bad",
