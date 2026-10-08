@@ -393,7 +393,7 @@ fn draw_ribbon(
     panel_bg(ui, rib, ui.theme.background);
 
     let tabs = ribbon_tabs_rects(rib, ui.theme);
-    for (i, (tab, r)) in RibbonTab::ALL.iter().zip(tabs.iter()).enumerate() {
+    for (tab, r) in RibbonTab::ALL.iter().zip(tabs.iter()) {
         let active = chrome.tab == Some(*tab);
         let resp = ui.button(*r, true);
         if active {
@@ -417,7 +417,6 @@ fn draw_ribbon(
         );
         if resp.clicked {
             chrome.tab = Some(*tab);
-            let _ = i;
         }
     }
 
@@ -445,17 +444,18 @@ fn draw_ribbon(
 
 /// Tab strip geometry, factored out so the drawing and the layout cannot drift.
 fn ribbon_tabs_rects(rib: Rect, theme: cad_ui::Theme) -> Vec<Rect> {
-    let w = text_width("Modify", theme.font_size) + 18.0;
+    // Each tab is as wide as its own label: a fixed width either clips "Modify"
+    // or wastes space on "Draw". They are laid out left to right and must not
+    // overlap, or only the leftmost one is ever clickable.
+    let mut x = rib.min.x + 4.0;
+    let y = rib.min.y + 2.0;
     RibbonTab::ALL
         .iter()
         .map(|t| {
-            let tw = text_width(t.label(), theme.font_size) + 18.0;
-            Rect::from_xywh(
-                rib.min.x + 4.0,
-                rib.min.y + 2.0,
-                tw.max(w * 0.6),
-                theme.row_height,
-            )
+            let w = text_width(t.label(), theme.font_size) + 18.0;
+            let r = Rect::from_xywh(x, y, w, theme.row_height);
+            x += w;
+            r
         })
         .collect()
 }
@@ -630,7 +630,6 @@ fn draw_layer_panel(
 
         // Name.
         let name = layer.name.clone();
-        let nw = text_width(&name, ui.theme.font_size);
         ui.text_sized(
             &name,
             Vec2::new(swr.max.x + 6.0, r.center().y - ui.theme.font_size * 0.5),
@@ -695,7 +694,6 @@ fn draw_layer_panel(
         {
             out.push(Action::SetCurrentLayer(*id));
         }
-        let _ = nw;
     }
 }
 
@@ -1135,10 +1133,23 @@ mod tests {
 
     #[test]
     fn title_marks_unsaved_changes() {
+        // A fresh session starts dirty (nothing has been saved yet), so this has
+        // to clear the flag to see the marker appear.
         let mut s = Session::new();
-        assert!(!title_of(&s).contains('*'));
-        s.dirty = true;
+        assert!(s.dirty, "a new drawing has unsaved state");
         assert!(title_of(&s).contains('*'), "{}", title_of(&s));
+        s.dirty = false;
+        assert!(!title_of(&s).contains('*'), "{}", title_of(&s));
+    }
+
+    #[test]
+    fn title_uses_the_file_name_when_there_is_one() {
+        let mut s = Session::new();
+        s.dirty = false;
+        s.path = Some(std::path::PathBuf::from("/tmp/plan.dxf"));
+        assert_eq!(title_of(&s), "plan.dxf", "{}", title_of(&s));
+        s.path = None;
+        assert_eq!(title_of(&s), "Untitled");
     }
 
     #[test]

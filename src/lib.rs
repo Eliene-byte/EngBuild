@@ -729,43 +729,25 @@ fn draw_entities(
 /// point would make the frame cost scale with the document rather than with what
 /// is visible.
 fn clip_polyline<F: FnMut(Vec2, Vec2)>(pts: &[Vec2], rect: Rect2, mut emit: F) {
-    if pts.is_empty() {
-        return;
-    }
-    let inside = |p: Vec2| rect.contains(p);
-    let mut run: Vec<Vec2> = Vec::new();
+    // Clip each segment independently and emit the visible run. Tracking
+    // continuous runs across segments would avoid a duplicate vertex at each
+    // boundary, but it costs a state machine per point and the shared vertex
+    // costs one segment's worth of overdraw at most.
     for w in pts.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        let (a_in, b_in) = (inside(a), inside(b));
-        if a_in && b_in {
-            if run.is_empty() {
-                run.push(a);
-            }
-            run.push(b);
-            continue;
-        }
-        if run.len() >= 2 {
-            for p in run.windows(2) {
-                emit(p[0], p[1]);
-            }
-        }
-        run.clear();
-        if a_in != b_in
-            && let Some(p) = clip_segment_to_rect(a, b, rect)
+        if let Some((p, q)) = clip_segment_to_rect(w[0], w[1], rect)
+            && p.distance_squared(q) > 1e-9
         {
-            run.push(if a_in { b } else { a });
-            run.push(p);
-        }
-    }
-    if run.len() >= 2 {
-        for p in run.windows(2) {
-            emit(p[0], p[1]);
+            emit(p, q);
         }
     }
 }
 
-/// Liang-Barsky clip of one segment against `rect`; `None` when fully outside.
-fn clip_segment_to_rect(a: Vec2, b: Vec2, rect: Rect2) -> Option<Vec2> {
+/// Liang-Barsky clip of one segment against `rect`.
+///
+/// Returns the clipped run's endpoints, or `None` when the segment misses the
+/// rect entirely. A fully inside segment comes back unchanged, so the caller
+/// does not need a separate case for it.
+fn clip_segment_to_rect(a: Vec2, b: Vec2, rect: Rect2) -> Option<(Vec2, Vec2)> {
     let d = b - a;
     let mut t0 = 0.0f32;
     let mut t1 = 1.0f32;
@@ -776,6 +758,7 @@ fn clip_segment_to_rect(a: Vec2, b: Vec2, rect: Rect2) -> Option<Vec2> {
         (d.y, rect.max.y - a.y),
     ] {
         if p.abs() < 1e-9 {
+            // Parallel to this edge: either always inside it or always outside.
             if q < 0.0 {
                 return None;
             }
@@ -783,6 +766,7 @@ fn clip_segment_to_rect(a: Vec2, b: Vec2, rect: Rect2) -> Option<Vec2> {
         }
         let t = q / p;
         if p < 0.0 {
+            // Leaving: the entry parameter must stay below the exit.
             if t > t1 {
                 return None;
             }
@@ -794,7 +778,7 @@ fn clip_segment_to_rect(a: Vec2, b: Vec2, rect: Rect2) -> Option<Vec2> {
             t1 = t1.min(t);
         }
     }
-    Some(a + d * (t0 + t1) * 0.5)
+    Some((a + d * t0, a + d * t1))
 }
 
 /// An X mark, the conventional symbol for a point entity.
@@ -1217,20 +1201,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clip_keeps_a_segment_inside() {
+    fn clip_leaves_a_fully_inside_segment_alone() {
         let r = Rect2::from_xywh(0.0, 0.0, 100.0, 100.0);
-        let p = clip_segment_to_rect(Vec2::new(10.0, 10.0), Vec2::new(20.0, 20.0), r).unwrap();
-        assert!(r.contains(p), "{p:?}");
+        let (p, q) = clip_segment_to_rect(Vec2::new(10.0, 10.0), Vec2::new(20.0, 20.0), r).unwrap();
+        assert!(p.distance(Vec2::new(10.0, 10.0)) < 1e-4, "{p:?}");
+        assert!(q.distance(Vec2::new(20.0, 20.0)) < 1e-4, "{q:?}");
     }
 
     #[test]
-    fn clip_truncates_a_crossing_segment() {
+    fn clip_truncates_a_segment_entering_from_the_left() {
         let r = Rect2::from_xywh(0.0, 0.0, 100.0, 100.0);
-        // Starts outside on the left, ends inside: the clipped point must be on
-        // the left edge, not the midpoint.
-        let p = clip_segment_to_rect(Vec2::new(-100.0, 50.0), Vec2::new(50.0, 50.0), r).unwrap();
+        // Starts outside on the left, ends inside: the entry point is on the left
+        // edge and the exit point is the original end.
+        let (p, q) =
+            clip_segment_to_rect(Vec2::new(-100.0, 50.0), Vec2::new(50.0, 50.0), r).unwrap();
         assert!((p.x - 0.0).abs() < 1e-3, "{p:?}");
         assert!((p.y - 50.0).abs() < 1e-3, "{p:?}");
+        assert!((q.x - 50.0).abs() < 1e-3, "{q:?}");
+    }
+
+    #[test]
+    fn clip_truncates_a_segment_leaving_to_the_right() {
+        let r = Rect2::from_xywh(0.0, 0.0, 100.0, 100.0);
+        let (p, q) =
+            clip_segment_to_rect(Vec2::new(50.0, 50.0), Vec2::new(150.0, 50.0), r).unwrap();
+        assert!((p.x - 50.0).abs() < 1e-3, "{p:?}");
+        assert!((q.x - 100.0).abs() < 1e-3, "{q:?}");
     }
 
     #[test]
@@ -1239,10 +1235,14 @@ mod tests {
         assert!(
             clip_segment_to_rect(Vec2::new(100.0, 100.0), Vec2::new(200.0, 200.0), r).is_none()
         );
+        // Passing entirely beside the rect on one axis is also a miss, and takes
+        // the `p.abs() < 1e-9` branch.
+        assert!(clip_segment_to_rect(Vec2::new(-5.0, 100.0), Vec2::new(20.0, 100.0), r).is_none());
     }
 
     #[test]
-    fn clipping_emits_the_inside_runs() {
+    fn clipping_emits_the_visible_runs() {
+        // One segment enters, one leaves: both have a visible part.
         let r = Rect2::from_xywh(0.0, 0.0, 100.0, 100.0);
         let pts = [
             Vec2::new(-50.0, 50.0),
@@ -1251,7 +1251,7 @@ mod tests {
         ];
         let mut n = 0;
         clip_polyline(&pts, r, |_, _| n += 1);
-        assert_eq!(n, 1, "one visible run inside the rect");
+        assert_eq!(n, 2);
     }
 
     #[test]
@@ -1275,6 +1275,17 @@ mod tests {
         let mut n = 0;
         clip_polyline(&pts, r, |_, _| n += 1);
         assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn a_zero_length_segment_inside_the_rect_is_dropped() {
+        // Clipping collapses a degenerate segment to zero length; emitting it
+        // would cost a quad per tessellation artefact.
+        let r = Rect2::from_xywh(0.0, 0.0, 100.0, 100.0);
+        let pts = [Vec2::new(50.0, 50.0), Vec2::new(50.0, 50.0)];
+        let mut n = 0;
+        clip_polyline(&pts, r, |_, _| n += 1);
+        assert_eq!(n, 0);
     }
 
     #[test]
@@ -1312,22 +1323,18 @@ mod tests {
     }
 
     #[test]
-    fn digits_map_from_characters_not_named_keys() {
-        // winit 0.30 dropped every punctuation NamedKey and the numpad's
-        // non-digit keys: `-`, `.`, `/` and numpad-enter all arrive as
-        // `Key::Character`. This pins that, because restoring named arms for
-        // them would not compile and would mean someone read the enum wrong.
+    fn digits_map_from_characters_and_punctuation_does_not() {
+        // winit 0.30 dropped every punctuation `NamedKey` and the numpad's
+        // non-digit keys, so `-`, `.`, `/` and numpad-enter all arrive as
+        // `Key::Character`. `char_to_key` has no arms for them -- there is no
+        // `Key::Minus` producer -- so they are dropped rather than guessed at.
+        // Punctuation reaches the command line as `Event::Text` instead, which
+        // is what makes paths like `open a.dxf` typeable at all.
         use winit::keyboard::Key as W;
-        for (s, want) in [
-            ("-", Key::Minus),
-            (".", Key::Period),
-            (",", Key::Comma),
-            ("/", Key::Slash),
-            ("7", Key::Num7),
-        ] {
-            assert_eq!(map_key(&W::Character(s.into())), Some(want), "{s}");
+        assert_eq!(map_key(&W::Character("7".into())), Some(Key::Num7));
+        for s in ["-", ".", ",", "/"] {
+            assert_eq!(map_key(&W::Character(s.into())), None, "{s}");
         }
-        // Anything with no Key variant is dropped rather than guessed at.
         assert_eq!(map_key(&W::Character("%".into())), None);
         assert_eq!(map_key(&W::Character("é".into())), None);
     }
