@@ -28,6 +28,8 @@ pub enum Action {
     Submit(String),
     /// Accept the top completion (Tab, or End on the line).
     AcceptCompletion(String),
+    /// Flip the UI between the dark and light themes.
+    ToggleTheme,
     ToggleLayerVisible(LayerId),
     ToggleLayerLocked(LayerId),
     SetCurrentLayer(LayerId),
@@ -275,6 +277,9 @@ pub fn draw(
     suggestions: &Suggestions,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
+    // The panels cast a shadow on the sheet. Drawn before any panel so the
+    // shadow lands on the sheet and not on the panel that cast it.
+    ui.shadow(panels.canvas, 6.0, 0.9);
     draw_menu_bar(ui, chrome, session, panels, &mut actions);
     draw_ribbon(ui, chrome, session, panels, &mut actions);
     draw_layer_panel(ui, chrome, session, panels, &mut actions);
@@ -391,6 +396,25 @@ fn draw_menu_bar(
                 out.push(Action::Command(cmd.name.to_string()));
                 chrome.open_menu = None;
             }
+        }
+    }
+
+    // A theme toggle, always visible: a dark model space on a light desktop is
+    // the single most common complaint about CAD apps, and it is one click.
+    if let Some(ic) = cad_ui::icon(if session.dark { "sun" } else { "moon" }) {
+        let r = Rect::from_xywh(bar.max.x - 150.0, bar.min.y + 3.0, 26.0, bar.height() - 6.0);
+        let resp = ui.button(r, true);
+        ui.icon(ic, r, ui.theme.text_dim, 0.62);
+        ui.tooltip(
+            r,
+            if session.dark {
+                "Light theme"
+            } else {
+                "Dark theme"
+            },
+        );
+        if resp.clicked {
+            out.push(Action::ToggleTheme);
         }
     }
 
@@ -1051,24 +1075,35 @@ fn draw_status_bar(
     let seg = ui.theme.text_dim;
     let strong = ui.theme.text;
 
-    let put = |ui: &mut Ui<'_>, x: &mut f32, label: &str, color: Rgba| {
-        if *x + text_width(label, f) + 14.0 > p.max.x {
+    // Each read-out is a plate with a label and a value, so the numbers read as
+    // a value rather than as text floating on the bar. The plate is what makes
+    // the difference between a status bar and a row of labels.
+    let put = |ui: &mut Ui<'_>, x: &mut f32, label: &str, value: &str, color: Rgba| {
+        let lw = text_width(label, f);
+        let vw = text_width(value, f);
+        let w = lw + vw + 16.0;
+        if *x + w > p.max.x {
             return;
         }
-        ui.text_sized(label, Vec2::new(*x, y), color, f);
-        *x += text_width(label, f) + 14.0;
+        let r = Rect::from_xywh(*x, p.min.y + 3.0, w, p.height() - 6.0);
+        ui.fill_round_rect(r, ui.theme.surface, ui.theme.border_radius);
+        ui.stroke_rect(r, ui.theme.border, 1.0);
+        ui.text_sized(label, Vec2::new(*x + 8.0, y), seg, f);
+        ui.text_sized(value, Vec2::new(*x + 8.0 + lw, y), color, f);
+        *x += w + 4.0;
     };
 
-    put(ui, &mut x, &format!("X {:.3}", facts.cursor.x), strong);
-    put(ui, &mut x, &format!("Y {:.3}", facts.cursor.y), strong);
-    put(ui, &mut x, &format!("Z {}", facts.scale), seg);
-    put(ui, &mut x, session.tool.id.label(), strong);
-    put(ui, &mut x, &format!("{} ents", facts.entities), seg);
+    put(ui, &mut x, "X", &format!("{:.3}", facts.cursor.x), strong);
+    put(ui, &mut x, "Y", &format!("{:.3}", facts.cursor.y), strong);
+    put(ui, &mut x, "Z", &format!("{}", facts.scale), seg);
+    put(ui, &mut x, "Tool", session.tool.id.label(), strong);
+    put(ui, &mut x, "Entities", &format!("{}", facts.entities), seg);
     if facts.selection > 0 {
         put(
             ui,
             &mut x,
-            &format!("{} sel", facts.selection),
+            "Selected",
+            &format!("{}", facts.selection),
             ui.theme.accent,
         );
     }
@@ -1138,6 +1173,14 @@ pub fn apply_action(action: &Action, session: &mut Session, chrome: &mut Chrome)
         }
         Action::Export => {
             session.status = StatusMessage::prompt("Type EXPORT <path>.dxf at the command line");
+        }
+        Action::ToggleTheme => {
+            session.dark = !session.dark;
+            session.theme = if session.dark {
+                cad_ui::Theme::dark()
+            } else {
+                cad_ui::Theme::light()
+            };
         }
         Action::About => {
             session.status = StatusMessage::info(concat!(

@@ -513,14 +513,30 @@ impl App {
 
         // --- canvas backdrop --------------------------------------------------
         let c = panels.canvas;
-        push_rect(
+        // A rounded sheet, not a rectangle: the drawing surface is paper, and a
+        // hard corner where the grid stops is what makes a viewport look like a
+        // rectangle instead of a sheet.
+        cad_gfx::batch::push_rounded_rect(
             &mut ui,
-            c.min.x * dpr,
-            c.min.y * dpr,
-            c.width() * dpr,
-            c.height() * dpr,
+            Rect2::from_xywh(
+                c.min.x * dpr,
+                c.min.y * dpr,
+                c.width() * dpr,
+                c.height() * dpr,
+            ),
             theme.canvas,
+            6.0 * dpr,
         );
+        // A hairline on each edge: the boundary of the plot, which is what a
+        // sheet of paper is and a canvas is not.
+        for (x, y, w, h) in [
+            (c.min.x * dpr, c.min.y * dpr, c.width() * dpr, 1.0),
+            (c.min.x * dpr, (c.max.y - 1.0) * dpr, c.width() * dpr, 1.0),
+            (c.min.x * dpr, c.min.y * dpr, 1.0, c.height() * dpr),
+            ((c.max.x - 1.0) * dpr, c.min.y * dpr, 1.0, c.height() * dpr),
+        ] {
+            push_rect(&mut ui, x, y, w, h, theme.border);
+        }
 
         // --- world ------------------------------------------------------------
         if self.session.viewport.show_grid {

@@ -147,6 +147,8 @@ pub struct Session {
     /// Path of the file being edited, if any.
     pub path: Option<std::path::PathBuf>,
     pub theme: cad_ui::Theme,
+    /// Which theme the user picked, so the choice survives a `New`.
+    pub dark: bool,
     /// Time accumulator, for animated UI.
     pub time: f32,
     /// The last commands run, oldest first, capped.
@@ -184,6 +186,7 @@ impl Session {
             dirty: true,
             path: None,
             theme: cad_ui::Theme::dark(),
+            dark: true,
             time: 0.0,
             command_log: Vec::new(),
             predictor: None,
