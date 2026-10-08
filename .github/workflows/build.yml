@@ -285,7 +285,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            mesa-vulkan-drivers libvulkan1 xvfb \
+            mesa-vulkan-drivers libvulkan1 vulkan-tools xvfb \
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libgl1-mesa-dev libegl1-mesa-dev pkg-config
@@ -304,9 +304,18 @@ jobs:
       - name: Launch and confirm it stays up
         run: |
           # lavapipe is Mesa's software Vulkan driver, so this exercises the same
-          # wgpu code path a real GPU would, just slowly.
-          export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          # wgpu code path a real GPU would, just slowly. The ICD filename is
+          # discovered rather than hardcoded: the exact path has moved between
+          # Ubuntu releases, and a wrong guess surfaces only as "vulkan
+          # drivers/libraries could not be loaded".
+          ICD=""
+          for f in /usr/share/vulkan/icd.d/lvp_icd.*.json \
+                   /usr/share/vulkan/icd.d/lvp_icd.json; do
+            if [ -f "$f" ]; then ICD="$f"; break; fi
+          done
+          echo "lavapipe ICD: ${ICD:-NOT FOUND}"
           export RUST_LOG=info
+          [ -n "$ICD" ] && export VK_ICD_FILENAMES="$ICD"
 
           xvfb-run -a -s "-screen 0 1600x900x24" ./target/release/cad > smoke.log 2>&1 &
           pid=$!
@@ -324,6 +333,13 @@ jobs:
               echo "::error title=smoke-log::$clean"
               n=$((n + 1))
             done < smoke.log
+            # GPU environment: without it "no adapter" is unactionable.
+            vulkaninfo --summary 2>&1 | head -25 | while IFS= read -r line; do
+              echo "::error title=smoke-gpu::$line"
+            done
+            ls -1 /usr/share/vulkan/icd.d/ 2>&1 | while IFS= read -r line; do
+              echo "::error title=smoke-icd::$line"
+            done
           }
 
           if ! kill -0 "$pid" 2>/dev/null; then
