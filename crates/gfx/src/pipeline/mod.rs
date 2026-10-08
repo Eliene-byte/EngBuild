@@ -228,10 +228,26 @@ impl PipelineSet {
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         });
+        // Occluded geometry that still respects what is already in the buffer.
         let depth_test_only = Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        });
+        // The 2D overlay and the UI draw on top of everything, so they must be in
+        // front of the whole depth range -- `Always`, and never writing.
+        //
+        // This cannot be `None`: wgpu compares the pipeline's depth attachment
+        // descriptor against the pass's with `==`, and a pipeline with no depth
+        // state is *not* the same as one that tests-and-discards. In a pass with
+        // a depth attachment that is a validation error, which is what made the
+        // app abort on the first frame after the sample-count fix.
+        let depth_overlay = Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         });
@@ -250,7 +266,7 @@ impl PipelineSet {
             "line-quad-2d",
             shaders::line_quad_2d(),
             line_quad_layout(),
-            None,
+            depth_overlay.clone(),
             None,
             &msaa,
             &target,
@@ -261,7 +277,7 @@ impl PipelineSet {
             "ui",
             shaders::ui(),
             ui_layout(),
-            None,
+            depth_overlay.clone(),
             None,
             &msaa,
             &target,
