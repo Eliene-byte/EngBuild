@@ -31,8 +31,6 @@ pub struct Globals {
     /// World-space eye position (x, y). The 3D shaders use it for the rim light
     /// and the grid's distance fade.
     pub eye: [f32; 2],
-    /// Explicit padding to 96 bytes.
-    pub _pad: [f32; 2],
 }
 
 impl Default for Globals {
@@ -50,7 +48,6 @@ impl Default for Globals {
             time: 0.0,
             frame: 0.0,
             eye: [0.0, 0.0],
-            _pad: [0.0, 0.0],
         }
     }
 }
@@ -101,10 +98,6 @@ pub struct LineQuadVertex {
     pub color: [f32; 4],
     pub pattern: [f32; 4],
     pub width: f32,
-    /// Explicit padding. `LineVertex` and `LineQuadVertex` are deliberately the
-    /// same size so `stride_helpers_are_stable` and the layout test agree; the
-    /// `Pod` derive rejects implicit padding, so it has to be written out.
-    pub _pad: [f32; 3],
 }
 
 fn ui_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -119,7 +112,7 @@ fn ui_layout() -> wgpu::VertexBufferLayout<'static> {
         6 => Float32x2,
     ];
     wgpu::VertexBufferLayout {
-        array_stride: 56,
+        array_stride: 52,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &ATTR,
     }
@@ -362,7 +355,6 @@ pub fn expand_lines(lines: &[LineVertex], out: &mut Vec<LineQuadVertex>) {
                 color: l.color,
                 pattern: l.pattern,
                 width: l.width,
-                _pad: [0.0; 3],
             });
         }
     }
@@ -536,7 +528,6 @@ mod tests {
             color: [0.0; 4],
             pattern: [0.0; 4],
             width: 0.0,
-            _pad: [0.0; 3],
         }];
         expand_lines(&[], &mut out);
         assert!(out.is_empty());
@@ -546,7 +537,7 @@ mod tests {
     fn stride_helpers_are_stable() {
         // These feed buffer allocations, so a silent change would corrupt
         // rendering. Pin them.
-        assert_eq!(ui_stride(), 56);
+        assert_eq!(ui_stride(), 52);
         assert_eq!(solid_stride(), 44);
         assert_eq!(line3d_stride(), 52);
     }

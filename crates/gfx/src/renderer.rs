@@ -123,11 +123,18 @@ impl RenderTarget {
 
     /// Combined projection * view, in the column-major order the shaders expect.
     pub fn view_proj(&self) -> [[f32; 4]; 4] {
-        mul4(self.projection, self.view)
+        // `mul4(a, b)` returns b*a, so the view has to be passed first to get
+        // projection * view. Getting this backwards still compiles and still
+        // looks like a matrix; it just maps every point onto w = 0, so the whole
+        // 3D view renders nothing.
+        mul4(self.view, self.projection)
     }
 }
 
 /// Column-major 4x4 multiply, matching `Mat4`'s memory order.
+///
+/// Note the argument order: this returns `b * a`, not `a * b`. That is what the
+/// existing tests pin, so the *call* has to compensate (see [`RenderTarget::view_proj`]).
 fn mul4(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut out = [[0.0f32; 4]; 4];
     for col in 0..4 {
@@ -406,7 +413,6 @@ impl Gpu {
             time,
             frame: self.stats.frame as f32,
             eye,
-            _pad: [0.0, 0.0],
         };
         self.pipelines.update_globals(&self.queue, &self.globals);
     }
