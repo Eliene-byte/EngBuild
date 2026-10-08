@@ -1298,7 +1298,13 @@ mod tests {
             other.doc.layers.by_name("round").is_some(),
             "layers must survive the round trip"
         );
-        assert_eq!(other.status.level, Level::Info);
+        // A successful open reports success, not an error.
+        assert_eq!(other.status.level, Level::Success);
+        assert!(
+            other.status.text.contains("round.cad"),
+            "the status should name the file: {:?}",
+            other.status.text
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
