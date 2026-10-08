@@ -18,3 +18,5 @@ cad-ui = { workspace = true }
 # drawing is a session operation, and the command line has to be able to do it
 # without going through the window.
 cad-io = { workspace = true }
+# The command-line suggestion model. No dependencies of its own.
+cad-ai = { workspace = true }

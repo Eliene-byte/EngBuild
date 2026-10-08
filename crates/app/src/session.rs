@@ -149,7 +149,18 @@ pub struct Session {
     pub theme: cad_ui::Theme,
     /// Time accumulator, for animated UI.
     pub time: f32,
+    /// The last commands run, oldest first, capped.
+    ///
+    /// This is the model's context. It is deliberately capped: a CAD session can
+    /// run thousands of commands and a longer context buys nothing here, while
+    /// making every prediction proportionally slower.
+    pub command_log: Vec<String>,
+    /// The command-line suggestion model, trained once on first use.
+    predictor: Option<cad_ai::suggest::NextCommand>,
 }
+
+/// How many commands of context the model is given.
+const COMMAND_LOG_CAP: usize = 8;
 
 impl Default for Session {
     fn default() -> Self {
@@ -174,7 +185,82 @@ impl Session {
             path: None,
             theme: cad_ui::Theme::dark(),
             time: 0.0,
+            command_log: Vec::new(),
+            predictor: None,
         }
+    }
+
+    // ----------------------------------------------------------- suggestions
+
+    /// Record a command so the model can use it as context.
+    fn log_command(&mut self, name: &str) {
+        // Log the *canonical* name, not what was typed: `L`, `line` and `LINE`
+        // are the same context for the model.
+        let canonical = match tool_for_command(name) {
+            Some(t) => t.command().to_string(),
+            None => name.to_ascii_lowercase(),
+        };
+        self.command_log.push(canonical);
+        if self.command_log.len() > COMMAND_LOG_CAP {
+            let excess = self.command_log.len() - COMMAND_LOG_CAP;
+            self.command_log.drain(..excess);
+        }
+    }
+
+    /// The model, trained on first use.
+    ///
+    /// Training is a few thousand full-batch steps over a few hundred rows. It
+    /// happens once per process and costs milliseconds, which is cheaper than
+    /// shipping a weight file and having to version it.
+    pub fn predictor(&mut self) -> &cad_ai::suggest::NextCommand {
+        self.predictor
+            .get_or_insert_with(cad_ai::suggest::NextCommand::trained)
+    }
+
+    /// What the user most likely wants to type next.
+    pub fn suggestion(&mut self) -> Option<&'static str> {
+        // Leave it untrained until something has already asked for it: the
+        // cold-start distribution is nearly uniform, so a session that never
+        // types a command never pays for it.
+        let net = self.predictor.as_ref()?;
+        let has_selection = !self.tool.selection.is_empty();
+        let tool_active = !self.tool.state.is_idle();
+        let log: Vec<&str> = self.command_log.iter().map(|s| s.as_str()).collect();
+        net.suggest(&log, has_selection, tool_active)
+            .first()
+            .map(|(n, _)| *n)
+    }
+
+    /// Completions for a partially typed prefix, best first.
+    ///
+    /// This is the path that always trains: the user typed something, so they
+    /// are using the command line, so the model is worth having.
+    pub fn completions(&mut self, prefix: &str) -> Vec<String> {
+        let known: Vec<&str> = cad_ai::suggest::VOCAB.to_vec();
+        let has_selection = !self.tool.selection.is_empty();
+        let tool_active = !self.tool.state.is_idle();
+        // Own the names rather than borrowing them from `self.command_log`: the
+        // model has to be trained through `&mut self`, and the two borrows would
+        // otherwise overlap.
+        let log: Vec<&str> = self.command_log.iter().map(|s| s.as_str()).collect();
+        let net = self
+            .predictor
+            .get_or_insert_with(cad_ai::suggest::NextCommand::trained);
+        let prior = net.distribution(&log, has_selection, tool_active);
+        cad_ai::suggest::rank(prefix, &known, &prior)
+            .into_iter()
+            .map(|(n, _)| n.to_string())
+            .collect()
+    }
+
+    /// The last `n` commands, oldest first, for display.
+    pub fn recent_commands(&self, n: usize) -> Vec<&str> {
+        self.command_log
+            .iter()
+            .rev()
+            .take(n)
+            .map(|s| s.as_str())
+            .collect()
     }
 
     // ------------------------------------------------------------- navigation
@@ -614,7 +700,8 @@ impl Session {
             return CommandResult::Ok;
         }
         let mut parts = line.split_whitespace();
-        let name = parts.next().unwrap_or("").to_ascii_lowercase();
+        let head = parts.next().unwrap_or("").to_string();
+        let name = head.to_ascii_lowercase();
         let arg = parts.next().unwrap_or("");
         let extra: Vec<&str> = parts.collect();
         // `open a.dxf b.dxf` is a typo, not a request to ignore an argument.
@@ -624,7 +711,17 @@ impl Session {
             return CommandResult::Error(format!("unexpected argument in `{line}`"));
         }
 
-        match name.as_str() {
+        // Only a command that actually ran becomes context. Logging a typo would
+        // teach the model that the user runs commands that do not exist.
+        let result = self.run_command_line_inner(&name, arg);
+        if result.is_ok() {
+            self.log_command(&name);
+        }
+        result
+    }
+
+    fn run_command_line_inner(&mut self, name: &str, arg: &str) -> CommandResult {
+        match name {
             "open" | "o" => {
                 if arg.is_empty() {
                     self.status = StatusMessage::prompt("Specify a file to open");
@@ -1443,6 +1540,88 @@ mod tests {
         let mut s = Session::new();
         assert!(s.run_command_line("   ").is_ok());
         assert_eq!(s.tool.id, ToolId::Select);
+    }
+
+    // ---------------------------------------------------------- suggestions
+
+    #[test]
+    fn commands_are_logged_in_canonical_form() {
+        let mut s = Session::new();
+        // `L` is an alias of `line`; the model must not see two different
+        // contexts for the same command.
+        assert!(s.run_command_line("L").is_ok());
+        assert_eq!(s.command_log, vec!["line".to_string()]);
+        assert!(s.run_command_line("circle").is_ok());
+        assert_eq!(s.recent_commands(2), vec!["circle", "line"]);
+    }
+
+    #[test]
+    fn a_failed_command_is_not_logged() {
+        let mut s = Session::new();
+        assert!(!s.run_command_line("wibble").is_ok());
+        assert!(s.command_log.is_empty(), "a typo must not become context");
+    }
+
+    #[test]
+    fn the_command_log_is_capped() {
+        let mut s = Session::new();
+        for _ in 0..30 {
+            let _ = s.run_command_line("zoomall");
+        }
+        assert!(
+            s.command_log.len() <= COMMAND_LOG_CAP,
+            "{} entries",
+            s.command_log.len()
+        );
+    }
+
+    #[test]
+    fn completions_find_a_prefix() {
+        let mut s = Session::new();
+        let c = s.completions("cir");
+        assert_eq!(c.first().map(|s| s.as_str()), Some("circle"), "{c:?}");
+    }
+
+    #[test]
+    fn completions_tolerate_a_typo() {
+        let mut s = Session::new();
+        let c = s.completions("mov");
+        assert!(
+            c.iter().any(|x| x == "move"),
+            "a mistyped prefix must still find its command: {c:?}"
+        );
+    }
+
+    #[test]
+    fn completions_for_nonsense_are_empty() {
+        let mut s = Session::new();
+        assert!(s.completions("qqqqqqqqqqqq").is_empty());
+    }
+
+    #[test]
+    fn the_suggestion_appears_once_the_model_exists() {
+        let mut s = Session::new();
+        // Nothing typed yet: deliberately untrained, so the UI shows nothing
+        // rather than a confident guess out of a cold start.
+        assert!(s.suggestion().is_none());
+        // One command typed, and `completions` trained the model.
+        let _ = s.completions("li");
+        let _ = s.run_command_line("line");
+        assert!(
+            s.suggestion().is_some(),
+            "the model should now have a top guess"
+        );
+    }
+
+    #[test]
+    fn the_model_is_small() {
+        let mut s = Session::new();
+        let _ = s.completions("l");
+        assert!(
+            s.predictor().parameters() < 6000,
+            "{} parameters",
+            s.predictor().parameters()
+        );
     }
 
     #[test]

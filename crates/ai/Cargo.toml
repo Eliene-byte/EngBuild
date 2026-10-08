@@ -1,0 +1,17 @@
+[package]
+name = "cad-ai"
+description = "Microservicos de inferencia puros em Rust: MLP minúsculo, sem dependencias nem rede."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# No dependencies, deliberately. This crate is the one place where a dependency
+# would be most tempting (an ML framework) and most costly: it would pull in
+# hundreds of transitive crates and tens of megabytes into a CAD app that is
+# otherwise a few megabytes. Everything here is forward passes and gradient
+# descent in `f32`.
+[dependencies]
+
+[dev-dependencies]

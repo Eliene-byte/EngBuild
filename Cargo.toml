@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/ai",
     "crates/core",
     "crates/geom",
     "crates/doc",
@@ -60,6 +61,7 @@ cad-snap = { path = "crates/snap" }
 cad-gfx = { path = "crates/gfx" }
 cad-ui = { path = "crates/ui" }
 cad-app = { path = "crates/app" }
+cad-ai = { path = "crates/ai" }
 
 # `gles` is not optional polish. Without it a machine with no Vulkan driver --
 # older Intel iGPU, many VMs, some laptops -- gets no adapter at all and the app

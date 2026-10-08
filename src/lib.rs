@@ -33,7 +33,7 @@ use cad_ui::theme::Theme;
 use cad_ui::widgets::{TextEditState, Ui};
 use winit::window::Window;
 
-use crate::chrome::{Action, Chrome, StatusFacts};
+use crate::chrome::{Action, Chrome, StatusFacts, Suggestions};
 
 pub use chrome::{Action as ChromeAction, Panels};
 
@@ -595,9 +595,26 @@ impl App {
         // The widget pass borrows the input state and both batches mutably, so
         // it has to come after every geometry write and cannot touch the
         // session. It reports `Action`s, which are applied below.
+        // Predict before the widget pass: the widget pass only has `&Session`,
+        // and the model trains lazily through `&mut Session`.
+        let prefix = self.chrome.command.text.clone();
+        let completions = if prefix.is_empty() {
+            Vec::new()
+        } else {
+            self.session.completions(&prefix)
+        };
+        let suggestions = Suggestions::build(&prefix, completions, self.session.suggestion());
+
         let actions = {
             let mut u = Ui::new(&mut self.input, theme, &mut lines, &mut ui).with_scale(dpr);
-            chrome::draw(&mut u, &mut self.chrome, &self.session, panels, facts)
+            chrome::draw(
+                &mut u,
+                &mut self.chrome,
+                &self.session,
+                panels,
+                facts,
+                &suggestions,
+            )
         };
         self.apply(actions);
 

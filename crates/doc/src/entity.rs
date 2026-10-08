@@ -644,6 +644,112 @@ impl Entity {
         out
     }
 
+    /// Mirror across the line through `center` with direction `dir`.
+    ///
+    /// The direction need not be normalised. Mirroring is the one transform
+    /// that can flip an entity's handedness, so it is computed by projecting
+    /// onto the axis and negating the perpendicular component rather than by
+    /// rotating twice: a closed polyline keeps its signed area exactly, which a
+    /// rotate-by-pi-then-rotate-back would only do up to rounding.
+    pub fn mirrored(&self, center: Vec3, dir: Vec3) -> Entity {
+        let mut out = self.clone();
+        let c2 = center.xy();
+        let d2 = dir.xy();
+        let len2 = d2.length_squared();
+        let mirror = |p: Vec2| {
+            if len2 < 1e-12 {
+                return c2;
+            }
+            let u = d2 * (1.0 / len2);
+            let rel = p - c2;
+            let along = u * rel.dot(u);
+            let perp = rel - along;
+            c2 + along - perp
+        };
+        let keep_z = |p: Vec3| Vec3::new(mirror(p.xy()).x, mirror(p.xy()).y, p.z);
+        let mirror3 = |p: Vec3| {
+            let m = mirror(p.xy());
+            Vec3::new(m.x, m.y, -p.z)
+        };
+        match &mut out.entity {
+            EntityKind::Line(l) => {
+                l.p0 = mirror(l.p0);
+                l.p1 = mirror(l.p1);
+            }
+            EntityKind::Circle(c) => c.center = mirror(c.center),
+            // An arc reverses its sweep when mirrored: the same angle range now
+            // traces the other side of the circle.
+            EntityKind::Arc(a) => {
+                a.center = mirror(a.center);
+                a.start_angle =
+                    (std::f32::consts::PI - a.start_angle).rem_euclid(std::f32::consts::TAU);
+            }
+            EntityKind::Ellipse(e) => e.center = mirror(e.center),
+            EntityKind::Polyline(p) | EntityKind::Region(p) => {
+                for q in &mut p.vertices {
+                    *q = mirror(*q);
+                }
+            }
+            EntityKind::Spline(s) => {
+                for seg in &mut s.segments {
+                    for p in seg.p.iter_mut() {
+                        *p = mirror(*p);
+                    }
+                }
+                for p in &mut s.control_points {
+                    *p = mirror(*p);
+                }
+            }
+            EntityKind::Text(t) => {
+                let m = mirror(t.insert.xy());
+                t.insert = Vec3::new(m.x, m.y, t.insert.z);
+                // A mirrored glyph run reads backwards unless the rotation is
+                // flipped too.
+                t.rotation = -t.rotation;
+            }
+            EntityKind::Hatch(h) => {
+                for l in &mut h.loops {
+                    for q in &mut l.vertices {
+                        *q = mirror(*q);
+                    }
+                }
+                h.pattern_angle = -h.pattern_angle;
+            }
+            EntityKind::Box(b) => {
+                // Swap opposite corners: the axis-aligned box stays axis-aligned.
+                let (mn, mx) = (b.min, b.max);
+                b.min = keep_z(mx);
+                b.max = keep_z(mn);
+            }
+            EntityKind::Point(p) => p.position = keep_z(p.position),
+            EntityKind::Construction(c) => {
+                c.from = keep_z(c.from);
+                c.to = keep_z(c.to);
+            }
+            EntityKind::Insert(i) => {
+                i.position = keep_z(i.position);
+                i.rotation = -i.rotation;
+                i.scale.y = -i.scale.y;
+            }
+            EntityKind::Face(f) => {
+                for p in &mut f.loop_pts {
+                    *p = mirror3(*p);
+                }
+                let n = f.plane.n;
+                f.plane = Plane3::new(Vec3::new(n.x, n.y, -n.z), f.plane.d);
+            }
+            EntityKind::Mesh(m) => {
+                for p in &mut m.positions {
+                    *p = mirror3(*p);
+                }
+                // Winding flips, so recompute rather than transform the normals.
+                m.recompute_normals();
+            }
+            EntityKind::Unknown { .. } => {}
+        }
+        out
+    }
+
     /// The effective colour given the entity's own override and its layer.
     pub fn resolved_color(&self, layer_color: Rgba) -> Rgba {
         match self.common.color {

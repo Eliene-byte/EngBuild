@@ -5,8 +5,8 @@
 //! [`Tool::on_key`]. They never see wgpu or winit types, which keeps the whole
 //! editing model testable without a GPU.
 
-use cad_core::{Camera2D, Rect2, Vec2};
-use cad_doc::{Document, Entity, EntityId};
+use cad_core::{Camera2D, Rect2, Vec2, Vec3};
+use cad_doc::{Document, Entity, EntityId, LayerId};
 use cad_geom::curve::{Arc, Circle, Line, Polyline};
 
 /// Identifies a tool.
@@ -94,6 +94,20 @@ impl ToolId {
     }
 }
 
+/// Which modify operation is in flight.
+///
+/// `Move`, `Copy` and `Mirror` are the ones that can be driven entirely from
+/// the mouse. `Rotate`, `Scale`, `Offset`, `Trim` and `Extend` need a number
+/// (an angle, a factor, a distance) and are therefore reachable from the command
+/// line with an argument instead -- the ribbon greys them out rather than
+/// offering a click sequence that cannot express what they need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModifyMode {
+    Move,
+    Copy,
+    Mirror,
+}
+
 /// Per-tool scratch state.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum ToolState {
@@ -106,10 +120,16 @@ pub enum ToolState {
         drag_from: Option<Vec2>,
         drag_to: Option<Vec2>,
     },
-    /// Entities captured at the start of a modify operation, so `Esc` restores.
-    Snapshot {
+    /// Entities captured at the start of a modify operation, so `Esc` restores
+    /// them, plus the points the operation is anchored at.
+    Modify {
         ids: Vec<EntityId>,
-        entities: Vec<Entity>,
+        originals: Vec<Entity>,
+        /// The first fixed point. `None` until the user picks it.
+        base: Option<Vec2>,
+        /// The second fixed point, for operations that need one (mirror axis).
+        axis: Option<Vec2>,
+        mode: ModifyMode,
     },
     /// Selection rectangle being dragged.
     Window { start: Vec2, current: Vec2 },
@@ -171,7 +191,21 @@ impl ToolState {
             }),
             ToolState::Window { .. } => Some("Specify opposite corner".into()),
             ToolState::Distance { .. } => Some("Specify distance".into()),
-            ToolState::Snapshot { .. } => Some("Specify destination point".into()),
+            ToolState::Modify {
+                base, axis, mode, ..
+            } => Some(match (mode, base.is_some()) {
+                // Mirror needs two points to define its axis, so it never asks
+                // for a destination.
+                (ModifyMode::Mirror, true) => {
+                    if axis.is_some() {
+                        "Select objects to mirror".into()
+                    } else {
+                        "Specify second point of axis".into()
+                    }
+                }
+                (_, false) => "Specify base point".into(),
+                (_, true) => "Specify destination point".into(),
+            }),
         }
     }
 }
@@ -224,10 +258,10 @@ impl Tool {
     /// Cancel the current operation, restoring a snapshot if one was taken.
     pub fn cancel(&mut self, doc: &mut Document) -> ToolOutcome {
         let out = match &self.state {
-            ToolState::Snapshot { ids, entities } => {
+            ToolState::Modify { ids, originals, .. } => {
                 // Put the originals back exactly as they were.
                 let mut restored = Vec::new();
-                for (id, e) in ids.iter().zip(entities.iter()) {
+                for (id, e) in ids.iter().zip(originals.iter()) {
                     doc.entities.restore(*id, e.clone());
                     restored.push(*id);
                 }
@@ -272,8 +306,8 @@ impl Tool {
             ToolId::Polyline => self.click_polyline(doc, world),
             ToolId::Rectangle => self.click_rectangle(doc, world),
             ToolId::Erase => self.click_erase(doc, cam, world),
-            ToolId::Move | ToolId::Copy => self.click_move(doc, world),
-            ToolId::Rotate => self.click_rotate(doc, world),
+            ToolId::Move => self.click_move(doc, world),
+            ToolId::Copy => self.click_copy(doc, world),
             ToolId::Mirror => self.click_mirror(doc, world),
             ToolId::Extrude => self.click_extrude(doc, world),
             ToolId::ZoomWindow => {
@@ -300,7 +334,16 @@ impl Tool {
                 *current = world;
                 ToolOutcome::None
             }
-            ToolState::Snapshot { .. } => ToolOutcome::None,
+            ToolState::Modify { base, axis, .. } => {
+                // Keep the anchor points tracking the cursor so the live preview
+                // (and the prompt) follow the mouse.
+                if base.is_none() {
+                    *base = Some(world);
+                } else if axis.is_none() {
+                    *axis = Some(world);
+                }
+                ToolOutcome::None
+            }
             _ => ToolOutcome::None,
         }
     }
@@ -535,33 +578,155 @@ impl Tool {
     }
 
     fn click_move(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
+        self.click_modify(doc, world, ModifyMode::Move)
+    }
+
+    fn click_copy(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
+        self.click_modify(doc, world, ModifyMode::Copy)
+    }
+
+    fn click_mirror(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
+        self.click_modify(doc, world, ModifyMode::Mirror)
+    }
+
+    /// Shared driver for Move / Copy / Mirror.
+    ///
+    /// All three need the same beats: capture the originals so `Esc` can put
+    /// them back, take the base point, then take the destination and apply.
+    /// `Copy` inserts instead of replacing and never disturbs the originals.
+    fn click_modify(&mut self, doc: &mut Document, world: Vec2, mode: ModifyMode) -> ToolOutcome {
         let ids = self.selection.clone();
-        match &mut self.state {
-            ToolState::Snapshot { .. } => ToolOutcome::None,
-            ToolState::Points { points, .. } => {
-                points.push(world);
-                ToolOutcome::None
+
+        // First click: capture.
+        if !matches!(self.state, ToolState::Modify { .. }) {
+            if ids.is_empty() {
+                return ToolOutcome::None;
             }
-            _ => {
-                if ids.is_empty() {
+            let originals: Vec<Entity> = ids
+                .iter()
+                .filter_map(|i| doc.entities.get(*i).cloned())
+                .collect();
+            if originals.is_empty() {
+                return ToolOutcome::None;
+            }
+            self.state = ToolState::Modify {
+                ids,
+                originals,
+                base: Some(world),
+                axis: None,
+                mode,
+            };
+            return ToolOutcome::None;
+        }
+
+        let (captured, base, axis, state_mode) =
+            match std::mem::replace(&mut self.state, ToolState::Idle) {
+                ToolState::Modify {
+                    ids,
+                    originals,
+                    base,
+                    axis,
+                    mode,
+                } => ((ids, originals), base, axis, mode),
+                other => {
+                    self.state = other;
                     return ToolOutcome::None;
                 }
-                let entities: Vec<Entity> = ids
-                    .iter()
-                    .filter_map(|i| doc.entities.get(*i).cloned())
-                    .collect();
-                self.state = ToolState::Snapshot { ids, entities };
-                ToolOutcome::None
+            };
+        let (ids, originals) = captured;
+        let Some(base) = base else {
+            return ToolOutcome::None;
+        };
+
+        if state_mode == ModifyMode::Mirror {
+            return match axis {
+                // The second click completes the axis; restore the state first so
+                // `commit_mirror` can take it.
+                Some(b) => {
+                    self.state = ToolState::Modify {
+                        ids,
+                        originals,
+                        base: Some(base),
+                        axis: Some(b),
+                        mode: state_mode,
+                    };
+                    self.commit_mirror(doc, base, b)
+                }
+                None => ToolOutcome::None,
+            };
+        }
+
+        let destination = world;
+        let delta = destination - base;
+        if delta.length_squared() < 1e-9 {
+            // A zero move is a cancel, not a no-op that leaves a stale snapshot.
+            return ToolOutcome::Restore;
+        }
+
+        match state_mode {
+            ModifyMode::Copy => {
+                let layer = doc.current_layer();
+                let mut made = Vec::with_capacity(originals.len());
+                for e in &originals {
+                    // `translated` keeps the original's layer; a copy is new
+                    // geometry, so it lands on the current layer.
+                    let target = if e.layer() == LayerId(0) {
+                        layer
+                    } else {
+                        e.layer()
+                    };
+                    made.push(
+                        doc.add(
+                            e.translated(Vec3::new(delta.x, delta.y, 0.0))
+                                .with_layer(target),
+                        ),
+                    );
+                }
+                self.selection = made.clone();
+                self.state = ToolState::Idle;
+                ToolOutcome::Created(made)
+            }
+            _ => {
+                let mut moved = Vec::with_capacity(ids.len());
+                for (id, e) in ids.iter().zip(originals.iter()) {
+                    doc.entities
+                        .replace(*id, e.translated(Vec3::new(delta.x, delta.y, 0.0)));
+                    moved.push(*id);
+                }
+                self.state = ToolState::Idle;
+                ToolOutcome::Changed(format!("Moved {} entities", moved.len()))
             }
         }
     }
 
-    fn click_rotate(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
-        self.click_move(doc, world)
-    }
-
-    fn click_mirror(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
-        self.click_move(doc, world)
+    /// Mirror the captured entities across the line through `a` and `b`.
+    fn commit_mirror(&mut self, doc: &mut Document, a: Vec2, b: Vec2) -> ToolOutcome {
+        let axis = b - a;
+        if axis.length_squared() < 1e-9 {
+            // A zero-length axis is not a line: put things back and let the user
+            // pick a real one rather than mirroring everything onto itself.
+            return ToolOutcome::Restore;
+        }
+        let (ids, _originals) = match std::mem::replace(&mut self.state, ToolState::Idle) {
+            ToolState::Modify { ids, originals, .. } => (ids, originals),
+            other => {
+                self.state = other;
+                return ToolOutcome::None;
+            }
+        };
+        let mut kept = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let Some(src) = doc.entities.get(*id).cloned() else {
+                continue;
+            };
+            doc.entities.replace(
+                *id,
+                src.mirrored(Vec3::new(a.x, a.y, 0.0), Vec3::new(axis.x, axis.y, 0.0)),
+            );
+            kept.push(*id);
+        }
+        self.state = ToolState::Idle;
+        ToolOutcome::Changed(format!("Mirrored {} entities", kept.len()))
     }
 
     fn click_extrude(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
@@ -957,6 +1122,165 @@ mod tests {
     }
 
     #[test]
+    fn move_actually_moves() {
+        // The Move tool used to capture the originals and then return `None`
+        // forever: nothing was ever applied.
+        let (mut doc, id) = doc_with_circle();
+        let mut t = Tool::new(ToolId::Move);
+        t.selection = vec![id];
+        assert_eq!(
+            t.on_click(&mut doc, &cam(), Vec2::ZERO, false),
+            ToolOutcome::None
+        );
+        assert!(matches!(t.state, ToolState::Modify { .. }));
+        let out = t.on_click(&mut doc, &cam(), Vec2::new(100.0, 50.0), false);
+        assert!(matches!(out, ToolOutcome::Changed(_)), "{out:?}");
+        match &doc.entities.get(id).unwrap().entity {
+            cad_doc::EntityKind::Circle(c) => {
+                assert!(
+                    c.center.distance(Vec2::new(110.0, 50.0)) < 1e-4,
+                    "{:?}",
+                    c.center
+                );
+            }
+            _ => panic!(),
+        }
+        // One entity moved: nothing was created and nothing was duplicated.
+        assert_eq!(doc.entities.len(), 1);
+        assert!(t.state.is_idle(), "the tool must be ready for another move");
+    }
+
+    #[test]
+    fn move_by_zero_cancels_instead_of_stranding_a_snapshot() {
+        let (mut doc, id) = doc_with_circle();
+        let mut t = Tool::new(ToolId::Move);
+        t.selection = vec![id];
+        t.on_click(&mut doc, &cam(), Vec2::new(5.0, 5.0), false);
+        let out = t.on_click(&mut doc, &cam(), Vec2::new(5.0, 5.0), false);
+        assert_eq!(out, ToolOutcome::Restore);
+        match &doc.entities.get(id).unwrap().entity {
+            cad_doc::EntityKind::Circle(c) => assert!(c.center.distance(Vec2::ZERO) < 1e-5),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn copy_keeps_the_original_and_adds_one() {
+        let (mut doc, id) = doc_with_circle();
+        let mut t = Tool::new(ToolId::Copy);
+        t.selection = vec![id];
+        t.on_click(&mut doc, &cam(), Vec2::ZERO, false);
+        let out = t.on_click(&mut doc, &cam(), Vec2::new(100.0, 0.0), false);
+        let ToolOutcome::Created(made) = out else {
+            panic!("a copy creates entities, got {out:?}");
+        };
+        assert_eq!(made.len(), 1);
+        assert_eq!(doc.entities.len(), 2);
+        // The original is untouched and the copy is selected.
+        match &doc.entities.get(id).unwrap().entity {
+            cad_doc::EntityKind::Circle(c) => assert!(c.center.distance(Vec2::ZERO) < 1e-5),
+            _ => panic!(),
+        }
+        assert_eq!(t.selection, made);
+    }
+
+    #[test]
+    fn copy_without_a_selection_does_nothing() {
+        let (mut doc, _) = doc_with_circle();
+        let mut t = Tool::new(ToolId::Copy);
+        assert_eq!(
+            t.on_click(&mut doc, &cam(), Vec2::ZERO, false),
+            ToolOutcome::None
+        );
+        assert_eq!(
+            t.on_click(&mut doc, &cam(), Vec2::new(5.0, 0.0), false),
+            ToolOutcome::None
+        );
+        assert_eq!(doc.entities.len(), 1);
+    }
+
+    #[test]
+    fn mirror_reflects_across_the_axis() {
+        let (mut doc, id) = doc_with_circle();
+        let mut t = Tool::new(ToolId::Mirror);
+        t.selection = vec![id];
+        // Axis: the Y axis. The circle at (10, 0) must land at (-10, 0).
+        t.on_click(&mut doc, &cam(), Vec2::ZERO, false);
+        let out = t.on_click(&mut doc, &cam(), Vec2::new(0.0, 50.0), false);
+        assert!(matches!(out, ToolOutcome::Changed(_)), "{out:?}");
+        match &doc.entities.get(id).unwrap().entity {
+            cad_doc::EntityKind::Circle(c) => {
+                assert!(
+                    c.center.distance(Vec2::new(-10.0, 0.0)) < 1e-4,
+                    "{:?}",
+                    c.center
+                );
+                assert!((c.radius - 10.0).abs() < 1e-5, "mirroring must not resize");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn mirror_keeps_a_polyline_area() {
+        // A reflection is orientation-reversing but area-preserving; this is the
+        // property that distinguishes it from a rotate-by-pi approximation.
+        let mut doc = Document::new();
+        let layer = doc.layers.ensure_default();
+        let square = Polyline::new(
+            vec![
+                Vec2::new(2.0, 1.0),
+                Vec2::new(4.0, 1.0),
+                Vec2::new(4.0, 3.0),
+                Vec2::new(2.0, 3.0),
+            ],
+            true,
+        );
+        let id = doc.add(Entity::polyline(square).with_layer(layer));
+        let area = doc.entities.get(id).unwrap().bounds_2d().size().x
+            * doc.entities.get(id).unwrap().bounds_2d().size().y;
+        doc.entities.replace(
+            id,
+            doc.entities.get(id).unwrap().mirrored(Vec3::ZERO, Vec3::X),
+        );
+        let after = doc.entities.get(id).unwrap().bounds_2d().size().x
+            * doc.entities.get(id).unwrap().bounds_2d().size().y;
+        assert!((area - after).abs() < 1e-3, "{area} vs {after}");
+        // And it actually moved: mirrored across x = 0 the x range flips.
+        // (Measured on the bounding box rather than a signed area, which
+        // `Curve` does not expose.)
+        let b = doc.entities.get(id).unwrap().bounds_2d();
+        assert!(b.max.x <= 0.0, "{b:?}");
+    }
+
+    #[test]
+    fn mirror_over_a_zero_length_axis_restores() {
+        let (mut doc, id) = doc_with_circle();
+        let mut t = Tool::new(ToolId::Mirror);
+        t.selection = vec![id];
+        t.on_click(&mut doc, &cam(), Vec2::ZERO, false);
+        // The second click lands on the first, so the axis degenerates.
+        assert_eq!(
+            t.on_click(&mut doc, &cam(), Vec2::ZERO, false),
+            ToolOutcome::Restore
+        );
+        match &doc.entities.get(id).unwrap().entity {
+            cad_doc::EntityKind::Circle(c) => assert!(c.center.distance(Vec2::ZERO) < 1e-5),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn modify_prompts_walk_through_the_operation() {
+        let (mut doc, id) = doc_with_circle();
+        let mut t = Tool::new(ToolId::Move);
+        t.selection = vec![id];
+        assert!(t.prompt().is_none(), "idle tool has no prompt");
+        t.on_click(&mut doc, &cam(), Vec2::ZERO, false);
+        assert_eq!(t.prompt().as_deref(), Some("Specify destination point"));
+    }
+
+    #[test]
     fn escape_restores_a_snapshot() {
         let mut doc = Document::new();
         let layer = doc.layers.ensure_default();
@@ -965,7 +1289,7 @@ mod tests {
         t.selection = vec![id];
         // Snapshot the originals.
         t.on_click(&mut doc, &cam(), Vec2::ZERO, false);
-        assert!(matches!(t.state, ToolState::Snapshot { .. }));
+        assert!(matches!(t.state, ToolState::Modify { .. }));
         // Mutate.
         if let Some(e) = doc.entities.get_mut(id) {
             *e = e.translated(Vec3::new(100.0, 0.0, 0.0));

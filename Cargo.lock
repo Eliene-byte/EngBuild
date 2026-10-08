@@ -180,9 +180,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cad-ai"
+version = "0.1.0"
+
+[[package]]
 name = "cad-app"
 version = "0.1.0"
 dependencies = [
+ "cad-ai",
  "cad-core",
  "cad-doc",
  "cad-geom",

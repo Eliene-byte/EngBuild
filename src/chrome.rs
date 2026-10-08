@@ -26,6 +26,8 @@ pub enum Action {
     Command(String),
     /// The command line was submitted.
     Submit(String),
+    /// Accept the top completion (Tab, or End on the line).
+    AcceptCompletion(String),
     ToggleLayerVisible(LayerId),
     ToggleLayerLocked(LayerId),
     SetCurrentLayer(LayerId),
@@ -204,6 +206,46 @@ impl Chrome {
     }
 }
 
+/// What the suggestion model said, computed by the caller.
+///
+/// The widget pass only has `&Session`, and predicting needs `&mut Session`
+/// because the model trains lazily, so the answer is computed before the pass
+/// and handed in rather than asked for inside it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Suggestions {
+    /// Completions for what has been typed, best first.
+    pub completions: Vec<String>,
+    /// The model's top guess with an empty line.
+    pub next: Option<&'static str>,
+    /// The tail of the top completion, to draw as ghost text.
+    pub ghost: Option<String>,
+}
+
+impl Suggestions {
+    /// Build from a prefix and a model's output.
+    pub fn build(prefix: &str, completions: Vec<String>, next: Option<&'static str>) -> Self {
+        let ghost = completions
+            .first()
+            .filter(|c| {
+                c.len() > prefix.len()
+                    && c.to_ascii_lowercase()
+                        .starts_with(&prefix.to_ascii_lowercase())
+            })
+            .map(|c| c[prefix.len()..].to_string());
+        Self {
+            completions,
+            next,
+            ghost,
+        }
+    }
+
+    /// Is there a completion to accept?
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn has(&self) -> bool {
+        !self.completions.is_empty()
+    }
+}
+
 /// Read-only measurements the status bar shows.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StatusFacts {
@@ -227,13 +269,14 @@ pub fn draw(
     session: &Session,
     panels: Panels,
     facts: StatusFacts,
+    suggestions: &Suggestions,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     draw_menu_bar(ui, chrome, session, panels, &mut actions);
     draw_ribbon(ui, chrome, session, panels, &mut actions);
     draw_layer_panel(ui, chrome, session, panels, &mut actions);
     draw_properties(ui, session, panels);
-    draw_command_line(ui, chrome, session, panels, &mut actions);
+    draw_command_line(ui, chrome, session, panels, suggestions, &mut actions);
     draw_status_bar(ui, session, panels, facts);
     actions
 }
@@ -874,12 +917,13 @@ fn draw_properties(ui: &mut Ui<'_>, session: &Session, panels: Panels) {
     field(ui, &mut y, "Colour", &format!("ACI {}", e.common.color));
 }
 
-/// The command line: a real text field plus the Enter-to-submit path.
+/// The command line: a real text field, model-driven completion, and submit.
 fn draw_command_line(
     ui: &mut Ui<'_>,
     chrome: &mut Chrome,
     session: &Session,
     panels: Panels,
+    suggestions: &Suggestions,
     out: &mut Vec<Action>,
 ) {
     let p = panels.command_line;
@@ -911,13 +955,46 @@ fn draw_command_line(
         (p.width() - pw - 20.0).max(20.0),
         (p.height() - 4.0).max(8.0),
     );
-    let (resp, _changed) = ui.text_field(field, &mut chrome.command, true);
+    let (_resp, _changed) = ui.text_field(field, &mut chrome.command, true);
+
+    // Ghost text: the tail of the top completion, drawn under what was typed so
+    // the user can see the whole word without leaving the caret.
+    if !chrome.command.focused {
+        // Nothing typed and nothing focused: offer the model's next guess.
+        if let Some(next) = suggestions.next
+            && chrome.command.text.is_empty()
+        {
+            let hint = format!("{next}  (predicted)");
+            ui.text_sized(
+                &hint,
+                Vec2::new(field.min.x + 6.0, y),
+                ui.theme.text_disabled,
+                ui.theme.font_size,
+            );
+        }
+    }
+    if let Some(ghost) = &suggestions.ghost
+        && !ghost.is_empty()
+    {
+        let typed_w = text_width(&chrome.command.text, ui.theme.font_size);
+        ui.text_sized(
+            ghost,
+            Vec2::new(field.min.x + 6.0 + typed_w, y),
+            ui.theme.text_disabled,
+            ui.theme.font_size,
+        );
+    }
+
+    // Tab accepts the top completion. The text field does not consume Tab, so
+    // this cannot double-fire.
+    if ui.input.key_pressed(cad_ui::input::Key::Tab)
+        && let Some(top) = suggestions.completions.first()
+    {
+        out.push(Action::AcceptCompletion(top.clone()));
+    }
 
     // Enter is consumed by the field (it drops focus), so submission has to be
     // detected from the same key press the field acted on.
-    if resp.changed && ui.input.key_pressed(cad_ui::input::Key::Enter) {
-        out.push(Action::Submit(chrome.command.text.clone()));
-    }
     if ui.input.key_pressed(cad_ui::input::Key::Enter) && !chrome.command.text.is_empty() {
         out.push(Action::Submit(chrome.command.text.clone()));
     }
@@ -1018,6 +1095,11 @@ pub fn apply_action(action: &Action, session: &mut Session, chrome: &mut Chrome)
             chrome.command.cursor = 0;
             chrome.command.sel_start = None;
             session.run_command_line(line);
+        }
+        Action::AcceptCompletion(word) => {
+            chrome.command.text = word.clone();
+            chrome.command.cursor = word.chars().count();
+            chrome.command.sel_start = None;
         }
         Action::ToggleLayerVisible(id) => session.toggle_layer_visibility(*id),
         Action::ToggleLayerLocked(id) => session.toggle_layer_lock(*id),
@@ -1158,6 +1240,67 @@ mod tests {
         assert_eq!(chrome_clamp(-5.0, 0.0, 10.0), 0.0);
         assert_eq!(chrome_clamp(50.0, 0.0, 10.0), 10.0);
         assert_eq!(chrome_clamp(5.0, 0.0, 10.0), 5.0);
+    }
+
+    #[test]
+    fn ghost_text_is_only_the_missing_tail() {
+        let s = Suggestions::build("li", vec!["line".into(), "list".into()], None);
+        assert_eq!(s.ghost.as_deref(), Some("ne"));
+        assert!(s.has());
+    }
+
+    #[test]
+    fn a_completion_that_does_not_extend_the_prefix_has_no_ghost() {
+        // `rank` also returns near-misses that are not prefix extensions; those
+        // must not be drawn inline, because the ghost would not line up with
+        // what the user typed.
+        let s = Suggestions::build("ln", vec!["line".into()], None);
+        assert!(s.ghost.is_none(), "{s:?}");
+    }
+
+    #[test]
+    fn an_empty_prefix_has_no_completions() {
+        let s = Suggestions::build("", Vec::new(), Some("line"));
+        assert!(!s.has());
+        assert!(s.ghost.is_none());
+        assert_eq!(s.next, Some("line"));
+    }
+
+    #[test]
+    fn suggestions_default_to_nothing() {
+        let s = Suggestions::default();
+        assert!(!s.has());
+        assert!(s.ghost.is_none());
+        assert!(s.next.is_none());
+    }
+
+    #[test]
+    fn accepting_a_completion_replaces_the_whole_line() {
+        let mut s = Session::new();
+        let mut c = Chrome::new();
+        apply_action(
+            &Action::AcceptCompletion("rectangle".into()),
+            &mut s,
+            &mut c,
+        );
+        assert_eq!(c.command.text, "rectangle");
+        assert_eq!(c.command.cursor, "rectangle".chars().count());
+        // Accepting is not submitting: nothing ran.
+        assert_eq!(s.tool.id, cad_app::tools::ToolId::Select);
+    }
+
+    #[test]
+    fn submitting_clears_the_line_after_running() {
+        let mut s = Session::new();
+        let mut c = Chrome::new();
+        c.command.text = "line".into();
+        apply_action(&Action::Submit("line".into()), &mut s, &mut c);
+        assert_eq!(
+            c.command.text, "",
+            "the line must be cleared after submitting"
+        );
+        assert_eq!(s.tool.id, cad_app::tools::ToolId::Line);
+        assert_eq!(s.recent_commands(1), vec!["line"]);
     }
 
     #[test]
