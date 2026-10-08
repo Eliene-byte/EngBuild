@@ -119,9 +119,15 @@ jobs:
           cat test.log
           if [ "$status" -ne 0 ]; then
             echo "::error title=test-summary::tests failed; see the failing cases below."
+            # The failing test names, then the panic messages, which are indented
+            # and carry the actual assertion.
             grep -E '^(test .*(FAILED|panicked)|failures:|error(\[|:))' test.log \
-              | head -60 | while IFS= read -r line; do
+              | head -40 | while IFS= read -r line; do
                 echo "::error title=test::$line"
+              done
+            grep -E '^ +thread .* panicked at |^ +assertion|left:|right:' test.log \
+              | head -40 | while IFS= read -r line; do
+                echo "::error title=test-panic::$line"
               done
             tail -n 30 test.log | while IFS= read -r line; do
               clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
