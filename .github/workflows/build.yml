@@ -2,6 +2,13 @@
 #
 # One job per platform so a macOS or Linux failure never blocks a Windows
 # release. Artifacts are uploaded per-platform and joined in `release`.
+#
+# Action versions are pinned to the Node 24 majors (checkout v7,
+# upload-artifact v7, download-artifact v8, gh-release v3). The v4/v2 majors
+# still run, but only because the runner forces them onto a Node 24 runtime it
+# no longer supports; bump a major whenever one of these is retired.
+#
+# Swatinem/rust-cache is left at v2 because that major already targets Node 24.
 
 name: build
 
@@ -30,7 +37,7 @@ jobs:
     name: test + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux window-system deps
         run: |
@@ -102,7 +109,7 @@ jobs:
 
       - name: Upload lint log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: clippy-log
           path: clippy.log
@@ -145,7 +152,7 @@ jobs:
     runs-on: windows-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -157,7 +164,7 @@ jobs:
       - name: Test
         run: cargo test --release --locked -p cad -p cad-core -p cad-geom -p cad-doc -p cad-snap -p cad-io -p cad-ui -p cad-app
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cad-windows-x64
           path: target/release/cad.exe
@@ -168,7 +175,7 @@ jobs:
     runs-on: windows-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-pc-windows-msvc
@@ -179,7 +186,7 @@ jobs:
       - name: Cross build
         run: cargo build --release --locked -p cad --target aarch64-pc-windows-msvc
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cad-windows-arm64
           path: target/aarch64-pc-windows-msvc/release/cad.exe
@@ -191,7 +198,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -215,7 +222,7 @@ jobs:
           strip dist/cad || true
           tar -czf cadkit-linux-x86_64.tar.gz -C dist cad
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cad-linux-x64
           path: cadkit-linux-x86_64.tar.gz
@@ -227,7 +234,7 @@ jobs:
     runs-on: macos-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -247,7 +254,7 @@ jobs:
           codesign --force --sign - dist/cad
           tar -czf cadkit-macos-universal.tar.gz -C dist cad
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cad-macos-universal
           path: cadkit-macos-universal.tar.gz
@@ -262,10 +269,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Collect artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -279,7 +286,7 @@ jobs:
           ls -la release
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release/*
           generate_release_notes: true
