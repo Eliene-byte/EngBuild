@@ -372,7 +372,14 @@ impl Session {
     /// is closer than an unsolved one, and the status bar says how far off it
     /// is rather than pretending it worked.
     pub fn constrain(&mut self, kind: ConstraintKind, value: Option<f32>) -> CommandResult {
-        if self.tool.selection.len() < 2 {
+        // Fix pins whatever is selected, so it needs one object, not two. Every
+        // other kind relates two objects to each other.
+        if kind == ConstraintKind::Fix {
+            if self.tool.selection.is_empty() {
+                self.status = StatusMessage::error("Select objects to fix");
+                return CommandResult::Unavailable;
+            }
+        } else if self.tool.selection.len() < 2 {
             self.status = StatusMessage::error("Select two objects to constrain");
             return CommandResult::Unavailable;
         }
