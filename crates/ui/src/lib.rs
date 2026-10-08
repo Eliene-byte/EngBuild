@@ -6,12 +6,14 @@
 //! project.
 
 pub mod font;
+pub mod icons;
 pub mod input;
 pub mod layout;
 pub mod theme;
 pub mod widgets;
 
 pub use font::measure as text_width;
+pub use icons::{Icon, by_name as icon};
 pub use input::{Event, Key, Modifiers, MouseButton};
 pub use layout::{Align, Layout, Padding, Rect, Size};
 pub use theme::Theme;

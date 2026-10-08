@@ -5,6 +5,7 @@
 //! what a text field genuinely needs (cursor, selection), no traits to learn,
 //! and the whole thing is a few hundred lines.
 
+use crate::font;
 use crate::input::{InputState, Key, Modifiers, MouseButton};
 use crate::layout::{Layout, Padding, Rect};
 use crate::theme::Theme;
@@ -607,6 +608,223 @@ impl<'a> Ui<'a> {
             hairline,
         );
         resp.clicked
+    }
+
+    // ------------------------------------------------------------------ icons
+
+    /// Draw `icon` filling `r`, stroked in `color`.
+    ///
+    /// The icon's own 16x16 grid is scaled to the rect, so the same icon reads at
+    /// any size. A hit-test helper and not a widget: a caller draws the plate and
+    /// calls this for the glyph, which is what keeps icon buttons and plain
+    /// icons in one code path.
+    pub fn icon(&mut self, icon: crate::icons::Icon, r: Rect, color: Rgba, scale: f32) {
+        let size = r.width().min(r.height()) * scale;
+        if size <= 0.0 {
+            return;
+        }
+        let cx = r.center().x;
+        let cy = r.center().y;
+        let unit = size / crate::icons::GRID;
+        let origin = Vec2::new(cx - size * 0.5, cy - size * 0.5);
+        let stroke = (size * 0.07).max(0.9);
+        for poly in crate::icons::decode(icon) {
+            // A run ends at the first padding point, which is (0,0).
+            let live = poly
+                .iter()
+                .copied()
+                .take_while(|p| *p != (0.0, 0.0))
+                .count()
+                .max(1);
+            let at = |p: (f32, f32)| Vec2::new(origin.x + p.0 * unit, origin.y + p.1 * unit);
+            if live == 1 {
+                // A dot. A zero-length segment still renders at this width, and
+                // that is the cheapest way to draw one.
+                let a = at(poly[0]);
+                self.batch2d.segment(a, a, color, stroke);
+            } else {
+                for w in poly[..live].windows(2) {
+                    self.batch2d.segment(at(w[0]), at(w[1]), color, stroke);
+                }
+            }
+        }
+    }
+
+    /// A tool-button plate: rounded, hover-lit, and an accent bar when active.
+    ///
+    /// The accent bar is what makes an active tool identifiable at a glance
+    /// without the chrome having to remember to repaint the label, so its state
+    /// and its label can never disagree.
+    pub fn tool_plate(&mut self, r: Rect, active: bool, enabled: bool, accent: Option<Rgba>) {
+        if !enabled {
+            self.fill_round_rect(r, self.theme.surface, self.theme.border_radius);
+            self.stroke_rect(r, self.theme.border, 1.0);
+            return;
+        }
+        let bg = if active {
+            self.theme.surface_active
+        } else {
+            self.theme.surface
+        };
+        self.fill_round_rect(r, bg, self.theme.border_radius);
+        let hovered = self.hovered(r);
+        // Hover lifts the whole plate; active draws a bar down the left edge so
+        // the state survives even where the accent colour is dim.
+        if active {
+            let bar = Rect::from_xywh(r.min.x + 2.0, r.min.y + 3.0, 3.0, r.height() - 6.0);
+            self.fill_rect(bar, accent.unwrap_or(self.theme.accent));
+        }
+        let border = if hovered {
+            self.theme.border_focused
+        } else {
+            self.theme.border
+        };
+        self.stroke_rect(r, border, if active { 1.5 } else { 1.0 });
+    }
+
+    /// An icon button: a plate, the icon, an optional caption, and a tooltip.
+    ///
+    /// Returns the response plus the icon's draw rect, so a caller that wants to
+    /// draw something else over the icon (a count badge, a colour swatch) can.
+    pub fn icon_button(
+        &mut self,
+        r: Rect,
+        icon: crate::icons::Icon,
+        caption: Option<&str>,
+        active: bool,
+        enabled: bool,
+        tip: &str,
+    ) -> (Response, Rect) {
+        let id = self.next_id();
+        let resp = self.interact(id, r, enabled);
+        self.tool_plate(r, active, enabled, None);
+        // The icon sits high enough to leave room for its caption.
+        let glyph = if caption.is_some() {
+            Rect::from_xywh(r.min.x, r.min.y, r.width(), r.height() * 0.62)
+        } else {
+            r
+        };
+        let color = if enabled {
+            if active {
+                self.theme.accent
+            } else if resp.hovered {
+                self.theme.text
+            } else {
+                self.theme.text_dim
+            }
+        } else {
+            self.theme.text_disabled
+        };
+        self.icon(icon, glyph, color, 0.62);
+        if let Some(c) = caption {
+            let w = font::measure(c, self.theme.font_size * 0.9);
+            self.text_sized(
+                c,
+                Vec2::new(
+                    r.center().x - w * 0.5,
+                    r.max.y - self.theme.font_size * 0.95,
+                ),
+                color,
+                self.theme.font_size * 0.9,
+            );
+        }
+        if !tip.is_empty() {
+            self.tooltip(r, tip);
+        }
+        (resp, glyph)
+    }
+
+    /// A toggle chip: a small rounded button that reads on or off.
+    ///
+    /// Chrome toggles (GRID, OSNAP, ORTHO) are the same widget everywhere, which
+    /// is why their on/off colour is decided in one place.
+    pub fn chip(&mut self, r: Rect, label: &str, on: bool) -> (Response, Rgba) {
+        let id = self.next_id();
+        let resp = self.interact(id, r, true);
+        let color = if on {
+            self.theme.success
+        } else {
+            self.theme.text_disabled
+        };
+        self.fill_round_rect(
+            r,
+            if resp.hovered {
+                self.theme.surface_hover
+            } else {
+                self.theme.surface
+            },
+            self.theme.border_radius,
+        );
+        self.stroke_rect(
+            r,
+            if on && resp.hovered {
+                self.theme.border_focused
+            } else if on {
+                self.theme.success.with_alpha(0.5)
+            } else {
+                self.theme.border
+            },
+            1.0,
+        );
+        let w = font::measure(label, self.theme.font_size);
+        self.text_sized(
+            label,
+            Vec2::new(
+                r.center().x - w * 0.5,
+                r.center().y - self.theme.font_size * 0.5,
+            ),
+            if resp.hovered { self.theme.text } else { color },
+            self.theme.font_size,
+        );
+        (resp, color)
+    }
+
+    /// A soft shadow, four translucent bars rather than a blurred quad.
+    ///
+    /// The UI shader has no blur and a real one is not worth a second pipeline
+    /// for three panel edges: the stepped bars read as the same soft line at
+    /// this size and cost four quads instead of a framebuffer.
+    pub fn shadow(&mut self, r: Rect, size: f32, strength: f32) {
+        if size <= 0.0 || strength <= 0.0 {
+            return;
+        }
+        let c = self.theme.text;
+        for i in 0..4 {
+            let d = size * (i as f32 + 1.0) / 4.0;
+            let a = strength * (1.0 - i as f32 / 4.0);
+            // Two edges only: a panel's shadow always falls on the same side.
+            self.fill_rect(
+                Rect::from_xywh(r.min.x, r.max.y, r.width(), d * 0.5),
+                c.with_alpha(a * 0.20),
+            );
+            self.fill_rect(
+                Rect::from_xywh(r.max.x, r.min.y, d * 0.5, r.height()),
+                c.with_alpha(a * 0.14),
+            );
+        }
+    }
+
+    /// A section rule: a label with a hairline running to the right of it.
+    pub fn rule(&mut self, r: Rect, label: &str, color: Rgba) {
+        let w = self.text_width(label, self.theme.font_size);
+        self.text_sized(
+            label,
+            Vec2::new(r.min.x, r.min.y + 2.0),
+            color,
+            self.theme.font_size,
+        );
+        let x = r.min.x + w + 8.0;
+        if r.width() - w - 8.0 > 0.0 {
+            self.fill_rect(
+                Rect::from_xywh(
+                    x,
+                    r.min.y + self.theme.font_size * 0.5 + 1.0,
+                    r.max.x - x,
+                    1.0,
+                ),
+                self.theme.border,
+            );
+        }
     }
 
     /// Convenience: begin a layout inside `r`.

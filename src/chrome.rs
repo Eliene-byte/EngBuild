@@ -90,40 +90,43 @@ pub const MENUS: [&str; 7] = ["File", "Edit", "View", "Draw", "Modify", "3D", "H
 /// Ribbon groups. Each is a labelled block of buttons.
 struct RibbonGroup {
     title: &'static str,
-    /// `(command, label, shortcut hint)`
-    buttons: &'static [(&'static str, &'static str, &'static str)],
+    /// `(icon name, command, label, shortcut)`.
+    ///
+    /// The icon name comes first so a button cannot be added with a command
+    /// and no icon, or with an icon no command runs.
+    buttons: &'static [(&'static str, &'static str, &'static str, &'static str)],
 }
 
-const DRAW_GROUP: &[(&str, &str, &str)] = &[
-    ("line", "Line", "L"),
-    ("circle", "Circle", "C"),
-    ("arc", "Arc", "A"),
-    ("polyline", "Polyline", "PL"),
-    ("rectangle", "Rectangle", "REC"),
+const DRAW_GROUP: &[(&str, &str, &str, &str)] = &[
+    ("line", "line", "Line", "L"),
+    ("circle", "circle", "Circle", "C"),
+    ("arc", "arc", "Arc", "A"),
+    ("polyline", "polyline", "Polyline", "PL"),
+    ("rect", "rectangle", "Rectangle", "REC"),
 ];
 
-const MODIFY_GROUP: &[(&str, &str, &str)] = &[
-    ("move", "Move", "M"),
-    ("copytool", "Copy", "CP"),
-    ("rotate", "Rotate", "RO"),
-    ("mirror", "Mirror", "MI"),
-    ("offset", "Offset", "O"),
-    ("trim", "Trim", "TR"),
-    ("erase", "Erase", "E"),
+const MODIFY_GROUP: &[(&str, &str, &str, &str)] = &[
+    ("move", "move", "Move", "M"),
+    ("copy", "copytool", "Copy", "CP"),
+    ("rotate", "rotate", "Rotate", "RO"),
+    ("mirror", "mirror", "Mirror", "MI"),
+    ("offse", "offset", "Offset", "O"),
+    ("trim", "trim", "Trim", "TR"),
+    ("trash", "erase", "Erase", "E"),
 ];
 
-const VIEW_GROUP: &[(&str, &str, &str)] = &[
-    ("zoomall", "Zoom All", "Z"),
-    ("zoomin", "Zoom In", ""),
-    ("zoomout", "Zoom Out", ""),
-    ("view3d", "3D Orbit", ""),
+const VIEW_GROUP: &[(&str, &str, &str, &str)] = &[
+    ("zoomall", "zoomall", "Zoom All", "Z"),
+    ("zoomin", "zoomin", "Zoom In", ""),
+    ("zoomout", "zoomout", "Zoom Out", ""),
+    ("3d", "view3d", "3D Orbit", ""),
 ];
 
-const FILE_GROUP: &[(&str, &str, &str)] = &[
-    ("new", "New", "Ctrl+N"),
-    ("open", "Open", "Ctrl+O"),
-    ("save", "Save", "Ctrl+S"),
-    ("export", "Export", ""),
+const FILE_GROUP: &[(&str, &str, &str, &str)] = &[
+    ("new", "new", "New", "Ctrl+N"),
+    ("open", "open", "Open", "Ctrl+O"),
+    ("save", "save", "Save", "Ctrl+S"),
+    ("export", "export", "Export", ""),
 ];
 
 /// Which ribbon tab is showing.
@@ -164,7 +167,7 @@ impl RibbonTab {
                 },
                 RibbonGroup {
                     title: "3D",
-                    buttons: &[("extrude", "Extrude", "")],
+                    buttons: &[("extrude", "extrude", "Extrude", "")],
                 },
             ],
             RibbonTab::View => vec![RibbonGroup {
@@ -277,7 +280,7 @@ pub fn draw(
     draw_layer_panel(ui, chrome, session, panels, &mut actions);
     draw_properties(ui, session, panels);
     draw_command_line(ui, chrome, session, panels, suggestions, &mut actions);
-    draw_status_bar(ui, session, panels, facts);
+    draw_status_bar(ui, session, panels, facts, suggestions, &mut actions);
     actions
 }
 
@@ -528,7 +531,7 @@ fn draw_ribbon_group(
 
     let btn_h = (area.height() - ui.theme.font_size - 6.0).max(ui.theme.row_height);
     let top = area.min.y + 3.0;
-    let rows: Vec<Vec<&(&str, &str, &str)>> =
+    let rows: Vec<Vec<&(&str, &str, &str, &str)>> =
         g.buttons.chunks(3).map(|c| c.iter().collect()).collect();
     let avail = area.width() - 6.0;
     let per_row = rows.len().max(1) as f32;
@@ -539,41 +542,51 @@ fn draw_ribbon_group(
         if y + btn_h > area.max.y - ui.theme.font_size - 4.0 {
             break;
         }
-        for (ci, (cmd, label, shortcut)) in row.iter().enumerate() {
+        for (ci, (icon_name, cmd, label, shortcut)) in row.iter().enumerate() {
             let x = area.min.x + 3.0 + ci as f32 * (col_w + 3.0);
             let r = Rect::from_xywh(x, y, col_w, btn_h);
             let needs_sel = command_needs_selection(cmd, session);
             let enabled = !needs_sel;
+            // The tool already showing is underlined, so the ribbon states which
+            // command is live without the user reading the command line.
+            let active = session.tool.id.command() == *cmd;
             let resp = ui.button(r, enabled);
-            let fg = if !enabled {
-                ui.theme.text_disabled
-            } else if resp.hovered {
-                ui.theme.text
-            } else {
-                ui.theme.text_dim
-            };
-            let lw = text_width(label, ui.theme.font_size);
-            ui.text_sized(
-                label,
-                Vec2::new(
-                    r.center().x - lw * 0.5,
-                    r.center().y
-                        - ui.theme.font_size * 0.5
-                        - if shortcut.is_empty() { 0.0 } else { 4.0 },
-                ),
-                fg,
-                ui.theme.font_size,
-            );
-            if !shortcut.is_empty() {
-                let sw = text_width(shortcut, ui.theme.font_size);
-                ui.text_sized(
-                    shortcut,
-                    Vec2::new(r.center().x - sw * 0.5, r.max.y - ui.theme.font_size - 1.0),
-                    ui.theme.text_disabled,
-                    ui.theme.font_size,
+            if let Some(ic) = cad_ui::icons::by_name(icon_name) {
+                ui.icon(
+                    ic,
+                    r,
+                    if active {
+                        ui.theme.accent
+                    } else if !enabled {
+                        ui.theme.text_disabled
+                    } else if resp.hovered {
+                        ui.theme.text
+                    } else {
+                        ui.theme.text_dim
+                    },
+                    0.62,
                 );
             }
-            ui.tooltip(r, label);
+            // An underline rather than a fill: the plate colour already carries
+            // hover, and two states on the same plate makes both ambiguous.
+            if active {
+                ui.fill_rect(
+                    Rect::from_xywh(r.min.x, r.max.y - 2.0, r.width(), 2.0),
+                    ui.theme.accent,
+                );
+            }
+            // A tip on every button. The icon is a reminder, the tooltip is the
+            // documentation, and a button with neither is a guessing game.
+            // Bind it to a name: `format!` in a temporary position inside a
+            // `tooltip` argument is freed before the call returns.
+            let tip = if !enabled {
+                "Select objects first".to_string()
+            } else if shortcut.is_empty() {
+                label.to_string()
+            } else {
+                format!("{label} ({shortcut})")
+            };
+            ui.tooltip(r, &tip);
             if resp.clicked {
                 out.push(Action::Command((*cmd).to_string()));
             }
@@ -602,31 +615,36 @@ fn draw_layer_panel(
     panel_bg(ui, p, ui.theme.background);
 
     let row = ui.theme.row_height;
-    let head = Rect::from_xywh(p.min.x, p.min.y, p.width(), row + 4.0);
-    ui.text_sized(
+    let head = Rect::from_xywh(p.min.x, p.min.y, p.width(), row + 6.0);
+    // A header plate rather than bare text: a panel that reads as a surface of
+    // its own says what it contains before the user looks for the label.
+    ui.fill_rect(
+        Rect::from_xywh(p.min.x, p.min.y, p.width(), head.height()),
+        ui.theme.surface,
+    );
+    ui.rule(
+        Rect::from_xywh(head.min.x + 8.0, head.min.y + 4.0, head.width() - 96.0, row),
         "LAYERS",
-        Vec2::new(head.min.x + 8.0, head.min.y + 6.0),
         ui.theme.text_dim,
-        ui.theme.font_size,
     );
-    let new_w = 46.0;
-    let new_r = Rect::from_xywh(head.max.x - new_w - 6.0, head.min.y + 2.0, new_w, row - 4.0);
-    let new_resp = ui.button(new_r, true);
-    ui.text_sized(
-        "+ New",
-        Vec2::new(
-            new_r.center().x - 18.0,
-            new_r.center().y - ui.theme.font_size * 0.5,
-        ),
-        if new_resp.hovered {
-            ui.theme.text
-        } else {
-            ui.theme.text_dim
-        },
-        ui.theme.font_size,
-    );
-    if new_resp.clicked {
-        out.push(Action::NewLayer);
+    // Icon-plus, not the words "+ New": at 26px wide the word wraps.
+    if let Some(ic) = cad_ui::icon("plus") {
+        let r = Rect::from_xywh(head.max.x - 34.0, head.min.y + 3.0, 30.0, row);
+        let resp = ui.button(r, true);
+        ui.icon(
+            ic,
+            r,
+            if resp.hovered {
+                ui.theme.text
+            } else {
+                ui.theme.accent
+            },
+            0.6,
+        );
+        ui.tooltip(r, "New layer");
+        if resp.clicked {
+            out.push(Action::NewLayer);
+        }
     }
     ui.fill_rect(
         Rect::from_xywh(p.min.x, head.max.y, p.width(), 1.0),
@@ -684,43 +702,40 @@ fn draw_layer_panel(
             ui.theme.font_size,
         );
 
-        // Visibility and lock toggles on the right.
+        // Visibility and lock, as icons: an eye and a padlock are readable at
+        // 20px where "O" and "L" are not, particularly side by side.
         let bw = 20.0;
         let lock_r = Rect::from_xywh(r.max.x - bw - 4.0, r.center().y - 9.0, bw, 18.0);
         let eye_r = Rect::from_xywh(lock_r.min.x - bw - 2.0, lock_r.min.y, bw, 18.0);
 
         let lock_resp = ui.button(lock_r, true);
-        ui.text_sized(
-            if layer.locked || layer.frozen {
-                "L"
-            } else {
-                " "
-            },
-            Vec2::new(
-                lock_r.center().x - 3.5,
-                lock_r.center().y - ui.theme.font_size * 0.5,
-            ),
-            if layer.locked || layer.frozen {
-                ui.theme.warning
-            } else {
-                ui.theme.text_disabled
-            },
-            ui.theme.font_size,
-        );
+        if let Some(ic) = cad_ui::icon("lock") {
+            ui.icon(
+                ic,
+                lock_r,
+                if layer.locked || layer.frozen {
+                    ui.theme.warning
+                } else {
+                    ui.theme.text_disabled
+                },
+                0.62,
+            );
+        }
+        ui.tooltip(lock_r, "Lock");
         let eye_resp = ui.button(eye_r, true);
-        ui.text_sized(
-            if layer.visible { "O" } else { "x" },
-            Vec2::new(
-                eye_r.center().x - 3.5,
-                eye_r.center().y - ui.theme.font_size * 0.5,
-            ),
-            if layer.visible {
-                ui.theme.accent
-            } else {
-                ui.theme.text_disabled
-            },
-            ui.theme.font_size,
-        );
+        if let Some(ic) = cad_ui::icon("eye") {
+            ui.icon(
+                ic,
+                eye_r,
+                if layer.visible {
+                    ui.theme.accent
+                } else {
+                    ui.theme.text_disabled
+                },
+                0.62,
+            );
+        }
+        ui.tooltip(eye_r, if layer.visible { "Hide" } else { "Show" });
 
         // Clicking the row makes the layer current; the two buttons take priority
         // because they are declared last and would otherwise be shadowed.
@@ -938,9 +953,20 @@ fn draw_command_line(
         .unwrap_or_else(|| "Command".to_string());
     let pw = text_width(&prompt, ui.theme.font_size) + 8.0;
     let y = p.center().y - ui.theme.font_size * 0.5;
+    // A prompt badge rather than bare text: while a tool is mid-sequence the
+    // prompt is the most important thing on the screen.
+    let plate = Rect::from_xywh(p.min.x + 6.0, p.min.y + 2.0, pw + 6.0, p.height() - 4.0);
+    if session.tool.prompt().is_some() {
+        ui.fill_round_rect(
+            plate,
+            ui.theme.accent.with_alpha(0.18),
+            ui.theme.border_radius,
+        );
+        ui.stroke_rect(plate, ui.theme.accent.with_alpha(0.45), 1.0);
+    }
     ui.text_sized(
         &prompt,
-        Vec2::new(p.min.x + 8.0, y),
+        Vec2::new(p.min.x + 14.0, y),
         if session.tool.prompt().is_some() {
             ui.theme.accent
         } else {
@@ -1001,7 +1027,14 @@ fn draw_command_line(
 }
 
 /// The status bar: coordinates, zoom, counts, toggles and the adapter name.
-fn draw_status_bar(ui: &mut Ui<'_>, session: &Session, panels: Panels, facts: StatusFacts) {
+fn draw_status_bar(
+    ui: &mut Ui<'_>,
+    session: &Session,
+    panels: Panels,
+    facts: StatusFacts,
+    _suggestions: &Suggestions,
+    out: &mut Vec<Action>,
+) {
     let p = panels.status_bar;
     if p.is_empty() {
         return;
@@ -1041,36 +1074,24 @@ fn draw_status_bar(ui: &mut Ui<'_>, session: &Session, panels: Panels, facts: St
     }
 
     // Toggles, right-aligned so they do not move when the read-outs change.
-    let toggles: [(&str, bool, Rgba); 4] = [
-        ("GRID", session.viewport.show_grid, ui.theme.success),
-        ("OSNAP", session.snap.settings.enabled, ui.theme.success),
-        (
-            "ORTHO",
-            session.snap.settings.has(SnapKind::Ortho),
-            ui.theme.success,
-        ),
-        (
-            "POLAR",
-            session.snap.settings.has(SnapKind::Polar),
-            ui.theme.success,
-        ),
+    // One widget decides on/off in one place, which is what stops the four from
+    // drifting into four different greys.
+    let toggles: [(&str, bool); 4] = [
+        ("GRID", session.viewport.show_grid),
+        ("OSNAP", session.snap.settings.enabled),
+        ("ORTHO", session.snap.settings.has(SnapKind::Ortho)),
+        ("POLAR", session.snap.settings.has(SnapKind::Polar)),
     ];
     let mut rx = p.max.x - 8.0;
-    for (label, on, on_color) in toggles.iter().rev() {
+    for (label, on) in toggles.iter().rev() {
         let w = text_width(label, f) + 12.0;
         let r = Rect::from_xywh(rx - w, p.min.y + 3.0, w, p.height() - 6.0);
-        let resp = ui.button(r, true);
-        let col = if *on {
-            *on_color
-        } else {
-            ui.theme.text_disabled
-        };
-        ui.text_sized(
-            label,
-            Vec2::new(r.center().x - text_width(label, f) * 0.5, y),
-            if resp.hovered { ui.theme.text } else { col },
-            f,
-        );
+        // The click *is* the toggle, so a status bar is a control and not only
+        // a read-out. `chrome::apply_action` runs the matching command.
+        let (resp, _color) = ui.chip(r, label, *on);
+        if resp.clicked {
+            out.push(Action::Command((*label).to_lowercase()));
+        }
         rx -= w + 4.0;
     }
 
@@ -1193,13 +1214,19 @@ mod tests {
         let reg = cad_app::command::CommandRegistry::new();
         for tab in RibbonTab::ALL {
             for g in tab.groups() {
-                for (cmd, label, _) in g.buttons {
+                for (icon_name, cmd, label, _) in g.buttons {
                     assert!(
                         reg.get(cmd).is_some(),
                         "{cmd} (tab {}) is not a command",
                         tab.label()
                     );
-                    assert!(!label.is_empty());
+                    assert!(!label.is_empty(), "{cmd} has no caption");
+                    // A missing icon renders an empty plate, which reads as a
+                    // broken button rather than an unlabelled one.
+                    assert!(
+                        cad_ui::icons::by_name(icon_name).is_some(),
+                        "{cmd} names non-existent icon {icon_name}"
+                    );
                 }
             }
         }
