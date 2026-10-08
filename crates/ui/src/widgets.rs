@@ -433,6 +433,10 @@ impl<'a> Ui<'a> {
                 state.sel_start = Some(0);
                 state.cursor = chars.len();
             }
+            // Write the caret back before the edits below: they all index `chars`
+            // with `state.cursor`, so a keyboard move that is only kept in the
+            // local would make Left/Right/Home/End look like they did nothing.
+            state.cursor = cursor;
 
             if state.sel_start.is_some()
                 && (self.input.key_pressed(Key::Delete) || self.input.key_pressed(Key::Backspace))
@@ -830,6 +834,42 @@ mod tests {
             u.text_field(rect(), &mut state, true);
         }
         assert_eq!(state.cursor, 3, "left arrow must move the caret");
+        i.end_frame();
+    }
+
+    #[test]
+    fn text_field_caret_navigation_persists() {
+        // Each of these used to be applied to a local cursor that was never
+        // written back, so the caret silently ignored the keyboard.
+        let (mut i, mut b, mut v) = setup();
+        let mut state = TextEditState::new("abcde");
+        state.focused = true;
+        state.cursor = 5;
+
+        for (key, want, what) in [
+            (Key::Left, 4, "Left"),
+            (Key::Home, 0, "Home"),
+            (Key::End, 5, "End"),
+            (Key::Right, 5, "Right must not pass the end"),
+            (Key::Left, 4, "Left again"),
+        ] {
+            i.push(
+                &Event::KeyDown {
+                    key,
+                    mods: Modifiers::NONE,
+                },
+                0.0,
+            );
+            {
+                let mut u = ui(&mut i, &mut b, &mut v);
+                u.text_field(rect(), &mut state, true);
+            }
+            assert_eq!(
+                state.cursor, want,
+                "{what} left the caret at the wrong place"
+            );
+            i.end_frame();
+        }
     }
 
     #[test]
