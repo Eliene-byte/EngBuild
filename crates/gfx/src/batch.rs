@@ -229,7 +229,10 @@ impl Batch2d {
         for w in pts.windows(2) {
             self.segment(w[0], w[1], color, width);
         }
-        if pts.len() > 2 && (pts[0] - pts[pts.len() - 1]).length_squared() < 1e-9 {
+        // Close the ring only when the last point is *not* already the first.
+        // The old condition did the opposite: it added a zero-length segment to
+        // an already-closed ring and left an open polyline unclosed.
+        if pts.len() > 2 && (pts[0] - pts[pts.len() - 1]).length_squared() >= 1e-9 {
             self.segment(pts[pts.len() - 1], pts[0], color, width);
         }
     }
@@ -610,7 +613,8 @@ mod tests {
     fn wire_box_has_twelve_edges() {
         let mut b = Batch3d::new();
         b.wire_box(Vec3::ZERO, Vec3::splat(1.0), C, 1.0);
-        assert_eq!(b.lines.len(), 24);
+        // 12 edges, each expanded to a 6-vertex quad.
+        assert_eq!(b.lines.len(), 72);
     }
 
     #[test]

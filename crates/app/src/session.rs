@@ -676,9 +676,19 @@ mod tests {
         let mut s = Session::new();
         assert!(s.activate("line").is_ok());
         assert_eq!(s.tool.id, ToolId::Line);
+        // A fresh tool has collected no points, so `prompt()` is None and the
+        // status bar announces the command instead. The point prompt appears
+        // after the first click.
+        assert_eq!(s.tool.prompt(), None);
+        assert!(
+            s.status.text.contains("Line"),
+            "status was {:?}",
+            s.status.text
+        );
+        s.click_world(Vec2::ZERO, false);
         assert_eq!(
             s.tool.prompt().as_deref(),
-            Some("Specify next point or [Undo] (0 taken)")
+            Some("Specify next point or [Undo] (1 taken)")
         );
     }
 
