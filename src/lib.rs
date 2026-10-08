@@ -1002,11 +1002,21 @@ mod tests {
     fn canvas_never_overlaps_a_panel() {
         let p = Panels::layout(1200.0, 800.0);
         assert!(p.canvas.contains(Vec2::new(600.0, 400.0)));
-        assert!(!p.canvas.overlaps(p.layer_panel));
-        assert!(!p.canvas.overlaps(p.properties));
-        assert!(!p.canvas.overlaps(p.ribbon));
-        assert!(!p.canvas.overlaps(p.command_line));
-        assert!(!p.canvas.overlaps(p.status_bar));
+        // The panels tile edge to edge and `Rect2::overlaps` is inclusive, so a
+        // shared border counts as overlap. What must not happen is the canvas
+        // covering any panel's area.
+        for panel in [
+            p.layer_panel,
+            p.properties,
+            p.ribbon,
+            p.command_line,
+            p.status_bar,
+        ] {
+            assert!(
+                !p.canvas.intersect(panel).has_area(),
+                "canvas and {panel:?} share area"
+            );
+        }
     }
 
     #[test]

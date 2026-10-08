@@ -412,10 +412,14 @@ mod tests {
     #[test]
     fn builtins_are_registered_with_unique_names() {
         let r = CommandRegistry::new();
-        assert!(r.len() > 40, "only {} commands", r.len());
+        assert!(r.len() >= 42, "only {} commands", r.len());
         let mut seen = std::collections::HashSet::new();
         for c in r.iter() {
-            assert!(seen.insert(c.name), "duplicate command name {}", c.name);
+            // Lookup is by lowercased name, so the registry must be unique under
+            // that normalisation too: "Line" and "line" would both resolve to the
+            // same key and the second would silently shadow the first.
+            let key = c.name.to_ascii_lowercase();
+            assert!(seen.insert(key), "duplicate command name {}", c.name);
         }
     }
 

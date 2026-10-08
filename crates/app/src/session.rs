@@ -533,12 +533,16 @@ mod tests {
         s
     }
 
+    /// A session holding two entities: a line and a circle, as the name says.
     fn session_with_line_and_circle() -> Session {
         let mut s = Session::new();
         let layer = s.doc.layers.ensure_default();
         s.doc.add(
             cad_doc::Entity::line(Line::new(Vec2::new(-5.0, 20.0), Vec2::new(5.0, 20.0)))
                 .with_layer(layer),
+        );
+        s.doc.add(
+            cad_doc::Entity::circle(Circle::new(Vec2::new(30.0, 30.0), 12.0)).with_layer(layer),
         );
         s.doc
             .entities
@@ -698,7 +702,7 @@ mod tests {
         assert!(s.dirty);
         s.click_world(Vec2::new(10.0, 0.0), false);
         assert_eq!(s.doc.entities.len(), 1);
-        match s.doc.entities.iter().next().unwrap().entity {
+        match &s.doc.entities.iter().next().unwrap().entity {
             cad_doc::EntityKind::Line(l) => assert!((l.length() - 10.0).abs() < 1e-4),
             _ => panic!(),
         }
