@@ -394,7 +394,9 @@ mod tests {
 
     #[test]
     fn malformed_data_decodes_to_nothing_rather_than_panicking() {
-        for bad in ["", "0", "08", "0G", "08G4", "88,88,8", "0", "0F0G"] {
+        // "08" is a single point, so it is *not* malformed: a polyline of one
+        // point is a dot, which is how every `select`-style icon ends.
+        for bad in ["", "0", "0G", "08G4", "88,88,8", "0", "0F0G", ","] {
             assert_eq!(
                 decode(Icon {
                     name: "bad",
@@ -451,8 +453,11 @@ mod tests {
         // what matters is that the bound and the nibble count agree.
         assert_eq!(GRID, 16.0);
         // What actually pins it: a coordinate is one hex digit, and the grid
-        // bound is one past the largest value a hex digit can hold.
-        assert_eq!(u32::from(char::from_digit(15, 16).unwrap()), 15);
-        assert_eq!((15u32 + 1) as f32, GRID);
+        // bound is one past the largest value a digit can hold.
+        assert_eq!(
+            char::from_digit(15, 16).and_then(|c| c.to_digit(16)),
+            Some(15)
+        );
+        assert_eq!(15u32 + 1, GRID as u32);
     }
 }

@@ -102,7 +102,7 @@ const DRAW_GROUP: &[(&str, &str, &str, &str)] = &[
     ("circle", "circle", "Circle", "C"),
     ("arc", "arc", "Arc", "A"),
     ("polyline", "polyline", "Polyline", "PL"),
-    ("rect", "rectangle", "Rectangle", "REC"),
+    ("rectangle", "rectangle", "Rect", "REC"),
 ];
 
 const MODIFY_GROUP: &[(&str, &str, &str, &str)] = &[
@@ -110,7 +110,7 @@ const MODIFY_GROUP: &[(&str, &str, &str, &str)] = &[
     ("copy", "copytool", "Copy", "CP"),
     ("rotate", "rotate", "Rotate", "RO"),
     ("mirror", "mirror", "Mirror", "MI"),
-    ("offse", "offset", "Offset", "O"),
+    ("offset", "offset", "Offset", "O"),
     ("trim", "trim", "Trim", "TR"),
     ("trash", "erase", "Erase", "E"),
 ];
