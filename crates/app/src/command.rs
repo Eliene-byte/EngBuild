@@ -420,6 +420,16 @@ impl CommandRegistry {
             Command::new("about", "About", "Help", "Version and licence information.")
                 .menu(&["Help", "About"]),
         );
+        // The command line doubles as a calculator, so "=" needs somewhere to
+        // put the answer. It is a real command rather than a special case in the
+        // parser: that way it shows up in `help` and can be scripted like any
+        // other.
+        self.register(Command::new(
+            "print",
+            "Print",
+            "Tools",
+            "Print a value on the command line.",
+        ));
     }
 }
 

@@ -195,6 +195,39 @@ impl Session {
 
     // ----------------------------------------------------------- suggestions
 
+    /// Run a natural-language request.
+    ///
+    /// This is the path that makes the app usable without knowing its aliases:
+    /// "draw a line from 0,0 to 10,10" runs the line tool, "circle at 5,5 radius
+    /// 3" runs the circle tool, and "= 5 + 3" prints 8. Anything the parser does
+    /// not recognise falls through to the command line, so a mistyped command is
+    /// still a mistyped command and not a silent no-op.
+    pub fn run_intent(&mut self, text: &str) -> CommandResult {
+        match cad_ai::parse(text) {
+            cad_ai::Intent::Command { name, args } => {
+                if name == "print" {
+                    self.status = StatusMessage::info(args);
+                    return CommandResult::Ok;
+                }
+                self.run_command_line_inner(&name, &args, &[])
+            }
+            cad_ai::Intent::Geometry { kind, a, b } => {
+                // Geometry needs the tool active and its points fed in, which is
+                // the same sequence a user would click through.
+                let cmd = kind.command();
+                // Geometry needs the tool active before its points mean
+                // anything, so a failure here must not leave the points behind.
+                if !self.run_command_line_inner(cmd, "", &[]).is_ok() {
+                    return CommandResult::Unavailable;
+                }
+                self.click_world(Vec2::new(a[0], a[1]), false);
+                self.click_world(Vec2::new(b[0], b[1]), false);
+                CommandResult::Ok
+            }
+            cad_ai::Intent::Unknown => CommandResult::Unavailable,
+        }
+    }
+
     /// Record a command so the model can use it as context.
     fn log_command(&mut self, name: &str) {
         // Log the *canonical* name, not what was typed: `L`, `line` and `LINE`

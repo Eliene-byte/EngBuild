@@ -282,7 +282,12 @@ pub fn train(net: &mut Mlp, data: &[Sample], epochs: usize, lr: f32, momentum: f
     loss
 }
 
+pub mod eval;
+pub mod language;
 pub mod suggest;
+
+pub use eval::evaluate;
+pub use language::{GeometryKind, Intent, parse};
 
 #[cfg(test)]
 mod tests {
