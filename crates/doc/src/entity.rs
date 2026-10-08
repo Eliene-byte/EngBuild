@@ -653,6 +653,41 @@ impl Entity {
     }
 
     /// Total length / area, for the properties palette.
+    /// The entity type as it appears in the properties palette.
+    ///
+    /// Distinct from [`Entity::kind`]: `kind` borrows the stored
+    /// `dxf_type` for entities we cannot model, so it is not `'static`, and a
+    /// properties panel that formats its rows every frame must not keep a
+    /// borrow alive across the frame.
+    pub fn type_name(&self) -> &'static str {
+        match &self.entity {
+            EntityKind::Line(_) => "Line",
+            EntityKind::Circle(_) => "Circle",
+            EntityKind::Arc(_) => "Arc",
+            EntityKind::Ellipse(_) => "Ellipse",
+            EntityKind::Polyline(_) => "Polyline",
+            EntityKind::Spline(_) => "Spline",
+            EntityKind::Point(_) => "Point",
+            EntityKind::Text(_) => "Text",
+            EntityKind::Hatch(_) => "Hatch",
+            EntityKind::Region(_) => "Region",
+            EntityKind::Box(_) => "Box",
+            EntityKind::Mesh(_) => "Mesh",
+            EntityKind::Face(_) => "Face",
+            EntityKind::Construction(_) => "Construction",
+            EntityKind::Insert(_) => "Insert",
+            EntityKind::Unknown { .. } => "Unknown",
+        }
+    }
+
+    /// Is this entity's geometry drawn as 3D solids rather than 2D lines?
+    pub fn is_3d(&self) -> bool {
+        matches!(
+            self.entity,
+            EntityKind::Box(_) | EntityKind::Mesh(_) | EntityKind::Face(_)
+        )
+    }
+
     pub fn measure(&self) -> Option<(f64, bool)> {
         match &self.entity {
             EntityKind::Line(l) => Some((l.length() as f64, false)),

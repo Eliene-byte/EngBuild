@@ -2,68 +2,42 @@
 //!
 //! This is the only crate that knows about the window system. Everything below
 //! it is testable without a display: `cad-app` owns the state, `cad-gfx` owns
-//! the GPU, `cad-ui` owns the widgets, and this crate wires them together.
+//! the GPU, `cad-ui` owns the widgets, `cad-io` owns the file formats, and this
+//! crate wires them together.
+//!
+//! The per-frame split is deliberate:
+//!
+//! ```text
+//!   winit event  ->  InputState  ->  chrome (widgets propose Actions)
+//!                                        |
+//!                        Session (document, camera, tools) <- Actions applied
+//!                             |                       |
+//!                    canvas geometry            3D geometry
+//!                             \                   /
+//!                              -> Gpu::render -> present
+//! ```
+
+mod chrome;
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use cad_app::command::CommandResult;
-use cad_app::session::{Session, StatusMessage};
-use cad_core::{Camera2D, Rect2, Rgba, Vec2};
+use cad_app::session::{Session, ViewMode};
+use cad_core::{Camera2D, Rect2, Vec2, Vec3};
 use cad_doc::EntityId;
 use cad_gfx::batch::{Batch2d, Batch3d, UiVertex, push_rect};
 use cad_gfx::renderer::{FrameError, Gpu, SurfaceConfig};
 use cad_ui::input::{Event, InputState, Key, Modifiers, MouseButton, ScrollDelta};
 use cad_ui::theme::Theme;
+use cad_ui::widgets::{TextEditState, Ui};
 use winit::window::Window;
 
-/// The 2D viewport is orthographic top-down, so screen pixels map to clip space
-/// with no transform. Every 2D shader derives its position from `resolution`
-/// alone; this is only here so the 3D pipelines have a sane matrix.
-const IDENTITY: [[f32; 4]; 4] = [
-    [1.0, 0.0, 0.0, 0.0],
-    [0.0, 1.0, 0.0, 0.0],
-    [0.0, 0.0, 1.0, 0.0],
-    [0.0, 0.0, 0.0, 1.0],
-];
+use crate::chrome::{Action, Chrome, StatusFacts};
 
-/// Panel geometry in CSS pixels, derived from the window size.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Panels {
-    pub canvas: Rect2,
-    pub ribbon: Rect2,
-    pub command_line: Rect2,
-    pub layer_panel: Rect2,
-    pub properties: Rect2,
-    pub status_bar: Rect2,
-}
+pub use chrome::{Action as ChromeAction, Panels};
 
-impl Panels {
-    /// Split the window the way a CAD app is laid out: ribbon on top, command
-    /// line and status bar at the bottom, layer and properties panels on the
-    /// sides.
-    pub fn layout(w: f32, h: f32) -> Self {
-        let w = w.max(0.0);
-        let h = h.max(0.0);
-        let ribbon_h = (96.0f32).min(h * 0.2);
-        let cmd_h = (28.0f32).min(h * 0.1);
-        let status_h = (22.0f32).min(h * 0.1);
-        let side_w = (240.0f32).min(w * 0.22);
-        let body_top = ribbon_h;
-        let body_bottom = (h - cmd_h - status_h).max(body_top);
-        let body_h = body_bottom - body_top;
-        Self {
-            ribbon: Rect2::from_xywh(0.0, 0.0, w, ribbon_h),
-            canvas: Rect2::from_xywh(side_w, body_top, (w - side_w * 2.0).max(0.0), body_h),
-            layer_panel: Rect2::from_xywh(0.0, body_top, side_w, body_h),
-            properties: Rect2::from_xywh((w - side_w).max(0.0), body_top, side_w, body_h),
-            command_line: Rect2::from_xywh(0.0, body_bottom, w, cmd_h),
-            status_bar: Rect2::from_xywh(0.0, (body_bottom + cmd_h).min(h), w, status_h),
-        }
-    }
-}
-
-/// The application: session, input, GPU and window.
+/// The application: session, input, GPU, window and chrome state.
 pub struct App {
     pub session: Session,
     pub input: InputState,
@@ -72,14 +46,15 @@ pub struct App {
     /// handle and the event loop still needs to drive it.
     pub window: Arc<Window>,
     pub panels: Panels,
+    pub chrome: Chrome,
     pub should_close: bool,
     pub frame: u64,
-    /// Command line buffer.
-    pub command_line: String,
     /// Where a left-drag started, in world coordinates.
     pub selection_anchor: Option<Vec2>,
     /// Current keyboard modifiers, tracked from winit's `ModifiersChanged`.
     mods: Modifiers,
+    /// Smoothed frame rate, for the status bar.
+    fps: f32,
     start: Instant,
     last: Instant,
 }
@@ -115,11 +90,12 @@ impl App {
             gpu,
             window,
             panels: Panels::layout(w, h),
+            chrome: Chrome::new(),
             should_close: false,
             frame: 0,
-            command_line: String::new(),
             selection_anchor: None,
             mods: Modifiers::NONE,
+            fps: 0.0,
             start: now,
             last: now,
         };
@@ -250,7 +226,6 @@ impl App {
                     let typed: String = text.chars().filter(|c| !c.is_control()).collect();
                     if !typed.is_empty() {
                         self.input.push(&Event::Text(typed), self.now());
-                        self.on_text();
                     }
                 }
             }
@@ -321,6 +296,16 @@ impl App {
         if d.y == 0.0 {
             return;
         }
+        // In the model-space view the wheel dollies the 3D camera; in the 2D
+        // drafting view it zooms the orthographic camera. Doing both at once
+        // would move the model twice as fast as the eye expects.
+        if self.session.viewport.mode == ViewMode::Model3d {
+            let f = if d.y > 0.0 { 1.0 / 1.1 } else { 1.1 };
+            self.session.viewport.cam3d.dolly(f);
+            self.session.viewport.refresh_target();
+            self.session.dirty = true;
+            return;
+        }
         let factor = if d.y > 0.0 { 1.1 } else { 1.0 / 1.1 };
         // Zoom about the cursor, in the *device* pixels the camera works in.
         let dpr = self.window.scale_factor() as f32;
@@ -331,9 +316,14 @@ impl App {
     fn on_key(&mut self, key: Key, mods: Modifiers) {
         match key {
             Key::F1 => {
-                let n = self.session.commands.len();
-                self.session.status =
-                    StatusMessage::info(format!("{n} commands - type help for the common ones"));
+                self.session.status = cad_app::session::StatusMessage::prompt(format!(
+                    "{} commands - type help",
+                    self.session.commands.len()
+                ));
+                return;
+            }
+            Key::F2 => {
+                self.session.zoom_by(0.5);
                 return;
             }
             Key::F3 => {
@@ -353,25 +343,19 @@ impl App {
                 return;
             }
             Key::Escape => {
+                // Escape closes the command line first, then cancels the tool.
+                if !self.chrome.command.text.is_empty() {
+                    self.chrome.command = TextEditState::new("");
+                    return;
+                }
+                if self.chrome.open_menu.take().is_some() {
+                    return;
+                }
                 let outcome = self.session.tool.cancel(&mut self.session.doc);
                 self.session.apply_outcome(outcome);
                 self.selection_anchor = None;
                 self.session.window_drag = None;
                 self.session.tracking_base = None;
-                return;
-            }
-            Key::Enter => {
-                if !self.command_line.is_empty() {
-                    let cmd = std::mem::take(&mut self.command_line);
-                    self.run_command(&cmd);
-                } else {
-                    self.session.tool.finish();
-                }
-                self.session.tracking_base = None;
-                return;
-            }
-            Key::Backspace => {
-                self.command_line.pop();
                 return;
             }
             _ => {}
@@ -380,11 +364,11 @@ impl App {
         if mods.command() {
             match key {
                 Key::Z => {
-                    self.session.undo();
+                    let _ = self.session.undo();
                     return;
                 }
                 Key::Y => {
-                    self.session.redo();
+                    let _ = self.session.redo();
                     return;
                 }
                 Key::A => {
@@ -392,29 +376,41 @@ impl App {
                     return;
                 }
                 Key::S => {
-                    self.session.status = StatusMessage::success("Saved");
+                    if mods.shift {
+                        self.chrome_open_save_as();
+                    } else {
+                        let _ = self.session.save(None);
+                    }
+                    return;
+                }
+                Key::O => {
+                    self.session.status =
+                        cad_app::session::StatusMessage::prompt("Type OPEN <path>");
                     return;
                 }
                 Key::N => {
-                    let theme = self.session.theme;
-                    let cam2d = self.session.viewport.cam2d;
-                    self.session = Session::new();
-                    self.session.theme = theme;
-                    self.session.viewport.cam2d = cam2d;
-                    self.session.viewport.canvas = self.panels.canvas;
+                    self.session.new_document();
                     return;
                 }
                 _ => {}
             }
         }
 
+        // While the command line has focus, every key belongs to it: the widget
+        // reads `input.text` and `keys_pressed` itself. Anything handled here
+        // would be a second, competing consumer of the same keystroke.
+        if self.chrome.command.focused {
+            return;
+        }
+
         // Plain letters go to the command line unless a tool is mid-prompt.
-        // Plain letters type into the command line, but only when no tool is
-        // waiting for a specific key.
         if self.session.tool.prompt().is_none()
             && let Some(c) = key.as_letter()
         {
-            self.command_line.push(c);
+            self.chrome.command.text.push(c);
+            self.chrome.command.cursor = self.chrome.command.text.chars().count();
+            self.chrome.command.focused = true;
+            self.session.dirty = true;
             return;
         }
 
@@ -422,84 +418,24 @@ impl App {
         self.session.apply_outcome(outcome);
     }
 
-    fn on_text(&mut self) {
-        if self.session.tool.prompt().is_none() {
-            self.command_line.push_str(&self.input.text);
-        }
+    fn chrome_open_save_as(&mut self) {
+        self.session.status =
+            cad_app::session::StatusMessage::prompt("Type SAVEAS <path> at the command line");
+        self.chrome.command.focused = true;
     }
 
     /// Run a command line such as `line` or `undo 3`.
-    ///
-    /// Returns the command's own result so a caller (or a test) can tell whether
-    /// the command ran, was unavailable, or failed. Unknown names come back as
-    /// `Error` after having been reported on the status bar.
     pub fn run_command(&mut self, line: &str) -> CommandResult {
-        let line = line.trim();
-        if line.is_empty() {
-            // Nothing typed: not an error, just no-op.
-            return CommandResult::Ok;
-        }
-        let name = line
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        // Every arm yields a CommandResult so the caller can report success;
-        // the old version mixed `()` and `CommandResult`, which did not compile.
-        let result = match name.as_str() {
-            "undo" | "u" => self.session.undo(),
-            "redo" => self.session.redo(),
-            "zoomall" | "z" => {
-                self.session.zoom_extents();
-                self.session.status = StatusMessage::info("Zoom extents");
-                CommandResult::Ok
-            }
-            "zoomin" => {
-                self.session.zoom_by(1.25);
-                CommandResult::Ok
-            }
-            "zoomout" => {
-                self.session.zoom_by(1.0 / 1.25);
-                CommandResult::Ok
-            }
-            "view3d" => self.session.toggle_3d(),
-            "grid" => self.session.toggle_grid(),
-            "snap" => self.session.toggle_snap(),
-            "ortho" => self.session.toggle_ortho(),
-            "polar" => self.session.toggle_polar(),
-            "erase" | "e" => {
-                if self.session.tool.selection.is_empty() {
-                    self.session.status = StatusMessage::info("Select objects, then Erase");
-                    CommandResult::Unavailable
-                } else {
-                    self.session.delete_selection()
-                }
-            }
-            // `select_all` mutates in place and reports nothing; wrap it so
-            // every arm of this match yields a CommandResult.
-            "selectall" | "all" => {
-                self.session.select_all();
-                CommandResult::Ok
-            }
-            "delete" | "del" => self.session.delete_selection(),
-            "help" | "?" => {
-                self.session.status = StatusMessage::info(
-                    "Commands: line, circle, arc, polyline, rect, erase, move, undo, zoomall, view3d",
-                );
-                CommandResult::Ok
-            }
-            other => {
-                let known = self.session.commands.get(other).is_some();
-                if known || cad_app::session::tool_for_command(other).is_some() {
-                    self.session.activate(other)
-                } else {
-                    self.session.status = StatusMessage::error(format!("Unknown command: {other}"));
-                    CommandResult::Error(format!("Unknown command: {other}"))
-                }
-            }
-        };
+        let r = self.session.run_command_line(line);
         self.session.dirty = true;
-        result
+        r
+    }
+
+    /// Apply a batch of chrome actions, in order.
+    fn apply(&mut self, actions: Vec<Action>) {
+        for a in actions {
+            chrome::apply_action(&a, &mut self.session, &mut self.chrome);
+        }
     }
 
     /// Advance time-dependent state and render.
@@ -508,78 +444,259 @@ impl App {
     /// frame timed out, and the next one should just be attempted.
     pub fn tick_and_draw(&mut self) -> Result<(), FrameError> {
         let now = Instant::now();
-        let dt = (now - self.last).as_secs_f32().min(0.1);
+        let dt = (now - self.last).as_secs_f32().clamp(0.0, 0.1);
         self.last = now;
+        // Exponential smoothing: a raw 1/dt jumps wildly on a single slow frame
+        // and the status bar number becomes unreadable.
+        if dt > 1e-4 {
+            let inst = 1.0 / dt;
+            self.fps = if self.fps <= 0.0 {
+                inst
+            } else {
+                self.fps * 0.9 + inst * 0.1
+            };
+        }
         self.session.tick(dt);
 
         let dpr = self.window.scale_factor() as f32;
         let size = self.window.inner_size();
         let (cw, ch) = (size.width as f32, size.height as f32);
-        let (lines, solids, ui) = build_geometry(self, dpr);
+        let (lines, solids, ui) = self.build_geometry(dpr);
 
-        // Resolution must be in *device* pixels: the shaders divide by it to get
-        // NDC, so CSS pixels would make every quad `dpr` times too small.
-        // In 2D drafting the "camera" is the orthographic top-down identity, so
-        // 2D geometry needs no matrix at all and the 3D shaders simply see
-        // nothing. A real 3D session would use `viewport.cam3d` here.
+        // In the 3D model view the shaders need the real camera; in 2D drafting
+        // the 2D pipelines derive NDC from `resolution` alone, so the matrix is
+        // unused there and passing the camera's is harmless.
+        let target = self.session.viewport.target();
+        let view_proj = if self.session.viewport.mode == ViewMode::Model3d {
+            target.view_proj()
+        } else {
+            identity_mat4()
+        };
+        let eye = self.session.viewport.cam3d.eye;
         self.gpu.set_globals(
-            IDENTITY,
+            view_proj,
             [cw, ch],
             self.session.viewport.cam2d.scale,
             dpr,
             self.session.time,
-            [
-                self.session.viewport.cam3d.eye.x,
-                self.session.viewport.cam3d.eye.y,
-            ],
+            [eye.x, eye.y],
         );
         self.gpu.render(&lines, &ui, &solids)?;
         self.frame += 1;
+        // Clear the per-frame input queues now that they have all been consumed.
+        self.input.end_frame();
         Ok(())
+    }
+
+    /// Status-bar read-outs for the chrome.
+    fn status_facts(&self) -> StatusFacts {
+        StatusFacts {
+            cursor: self.session.cursor_world,
+            scale: self.session.viewport.cam2d.scale,
+            entities: self.session.doc.entities.len(),
+            selection: self.session.tool.selection.len(),
+            fps: self.fps,
+            adapter: adapter_label(&self.gpu),
+        }
+    }
+
+    /// Build the frame's geometry: canvas, world, chrome.
+    fn build_geometry(&mut self, dpr: f32) -> (Batch2d, Batch3d, Vec<UiVertex>) {
+        let mut lines = Batch2d::new();
+        let mut solids = Batch3d::new();
+        let mut ui: Vec<UiVertex> = Vec::new();
+
+        let panels = self.panels;
+        let cam = self.session.viewport.cam2d;
+        let theme = self.session.theme;
+        let facts = self.status_facts();
+
+        // --- canvas backdrop --------------------------------------------------
+        let c = panels.canvas;
+        push_rect(
+            &mut ui,
+            c.min.x * dpr,
+            c.min.y * dpr,
+            c.width() * dpr,
+            c.height() * dpr,
+            theme.canvas,
+        );
+
+        // --- world ------------------------------------------------------------
+        if self.session.viewport.show_grid {
+            draw_grid(&mut lines, &cam, c, dpr, &self.session.viewport, theme.grid);
+        }
+        if self.session.viewport.show_axes {
+            draw_axes(
+                &mut lines,
+                cam.world_to_screen(Vec2::ZERO) * dpr,
+                c,
+                dpr,
+                theme,
+            );
+        }
+        draw_entities(&mut lines, &mut solids, &self.session, &cam, c, dpr, theme);
+
+        // --- 3D ---------------------------------------------------------------
+        if self.session.viewport.mode == ViewMode::Model3d && self.session.viewport.show_grid {
+            // One big quad centred on the orbit target. The shader computes the
+            // lines per fragment and fades them by distance, so a CPU-generated
+            // line grid would alias badly at this scale.
+            let t = self.session.viewport.cam3d.target;
+            let r = 4000.0f32;
+            solids.ground_plane(
+                Vec3::new(t.x - r, t.y - r, 0.0),
+                Vec3::new(t.x + r, t.y + r, 0.0),
+            );
+        }
+
+        // --- previews and crosshair ------------------------------------------
+        let mut rects = self.session.tool.preview();
+        if let Some((a, b)) = self.session.window_drag {
+            rects.push(Rect2::new(a, b));
+        }
+        for r in rects {
+            stroke_world_rect(&mut lines, &cam, r, dpr, theme.rubber_band);
+        }
+
+        // Snap marker: AutoCAD shows which snap fired and where. Without it the
+        // user cannot tell whether a point was snapped at all.
+        if let Some(s) = self
+            .session
+            .snap
+            .last
+            .filter(|_| self.session.snap.settings.enabled)
+            && c.contains(self.input.mouse)
+        {
+            draw_snap_marker(&mut lines, &cam, s.point, dpr, theme.rubber_band);
+            let label = s.kind.marker().to_string();
+            let p = cam.world_to_screen(s.point) * dpr;
+            let w = cad_ui::text_width(&label, theme.font_size) * dpr;
+            lines.segment(
+                Vec2::new(p.x + 8.0 * dpr, p.y + 10.0 * dpr),
+                Vec2::new(p.x + 8.0 * dpr + w, p.y + 10.0 * dpr),
+                theme.rubber_band,
+                dpr,
+            );
+        }
+
+        if c.contains(self.input.mouse) {
+            let m = self.input.mouse * dpr;
+            let (x0, y0) = (c.min.x * dpr, c.min.y * dpr);
+            let (x1, y1) = (c.max.x * dpr, c.max.y * dpr);
+            lines.segment(Vec2::new(x0, m.y), Vec2::new(x1, m.y), theme.grid, dpr);
+            lines.segment(Vec2::new(m.x, y0), Vec2::new(m.x, y1), theme.grid, dpr);
+            if let Some(base) = self.session.tracking_base {
+                lines.segment(cam.world_to_screen(base) * dpr, m, theme.rubber_band, dpr);
+            }
+        }
+
+        // --- chrome -----------------------------------------------------------
+        // The widget pass borrows the input state and both batches mutably, so
+        // it has to come after every geometry write and cannot touch the
+        // session. It reports `Action`s, which are applied below.
+        let actions = {
+            let mut u = Ui::new(&mut self.input, theme, &mut lines, &mut ui).with_scale(dpr);
+            chrome::draw(&mut u, &mut self.chrome, &self.session, panels, facts)
+        };
+        self.apply(actions);
+
+        (lines, solids, ui)
     }
 }
 
-/// Build the frame's geometry from the session.
-pub fn build_geometry(app: &App, dpr: f32) -> (Batch2d, Batch3d, Vec<UiVertex>) {
-    let cam = app.session.viewport.cam2d;
-    let theme = app.session.theme;
-    let panels = app.panels;
-    let mut lines = Batch2d::new();
-    let solids = Batch3d::new();
-    let mut ui: Vec<UiVertex> = Vec::new();
-
-    let c = panels.canvas;
-    push_rect(
-        &mut ui,
-        c.min.x * dpr,
-        c.min.y * dpr,
-        c.width() * dpr,
-        c.height() * dpr,
-        theme.canvas,
-    );
-
-    if app.session.viewport.show_grid {
-        draw_grid(&mut lines, &cam, c, dpr, &app.session.viewport, theme.grid);
-    }
-    if app.session.viewport.show_axes {
-        draw_axes(
-            &mut lines,
-            cam.world_to_screen(Vec2::ZERO) * dpr,
-            c,
-            dpr,
-            theme,
-        );
-    }
-
-    let hover = app.session.tool.hovered;
-    let selection = &app.session.tool.selection;
+/// Draw every entity: 2D curves through the tessellator, 3D solids and meshes
+/// straight into the 3D batch.
+fn draw_entities(
+    lines: &mut Batch2d,
+    solids: &mut Batch3d,
+    session: &Session,
+    cam: &Camera2D,
+    canvas: Rect2,
+    dpr: f32,
+    theme: Theme,
+) {
+    let hover = session.tool.hovered;
+    let selection = &session.tool.selection;
     let view = cam.world_viewport();
     let tolerance = cam.world_per_pixel() * 0.25;
-    for (i, e) in app.session.doc.entities.iter().enumerate() {
+    let dpr = if dpr > 0.0 { dpr } else { 1.0 };
+
+    for (i, e) in session.doc.entities.iter().enumerate() {
         let id = EntityId(i as u32);
-        if !e.common.visible || !app.session.doc.layers.visible(e.layer()) {
+        if !e.common.visible || !session.doc.layers.visible(e.layer()) {
             continue;
         }
+        let selected = selection.contains(&id);
+        let hovered = hover == Some(id);
+        let lc = session.doc.layers.color_of(e.layer(), theme.text);
+        let base = if selected {
+            theme.selection
+        } else {
+            e.resolved_color(lc)
+        };
+        let color = if hovered { theme.highlight } else { base };
+        let width = if hovered || selected { 2.5 } else { 1.5 };
+
+        // 3D geometry goes to its own batch, with the real camera.
+        if e.is_3d() {
+            match &e.entity {
+                cad_doc::EntityKind::Box(b) => {
+                    solids.solid_box(b.min, b.max, color);
+                    solids.wire_box(b.min, b.max, theme.border_focused, 1.0);
+                }
+                cad_doc::EntityKind::Mesh(m) => solids.mesh(m, color),
+                cad_doc::EntityKind::Face(f) => {
+                    for p in f.loop_pts.windows(2) {
+                        solids.segment(p[0], p[1], color, 1.5);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // Points and hatches have no curve; draw them as marks.
+        match &e.entity {
+            cad_doc::EntityKind::Point(p) => {
+                let s = cam.world_to_screen(p.position.xy()) * dpr;
+                draw_cross_mark(lines, s, 4.0 * dpr, color, dpr);
+            }
+            cad_doc::EntityKind::Construction(cons) => {
+                let a = cam.world_to_screen(cons.from.xy()) * dpr;
+                let b = cam.world_to_screen(cons.to.xy()) * dpr;
+                lines.dashed(a, b, color, dpr, cad_gfx::batch::Dash::new(8.0, 6.0, 0.0));
+            }
+            cad_doc::EntityKind::Text(t) => {
+                draw_text_entity(lines, cam, t, dpr, color, theme);
+            }
+            cad_doc::EntityKind::Hatch(h) => {
+                if h.solid {
+                    // A solid hatch is its boundary, filled in the boundary colour:
+                    // the UI pipeline has no polygon fill, so this is honest
+                    // rather than pretending.
+                    for l in &h.loops {
+                        let pts: Vec<Vec2> = l
+                            .vertices
+                            .iter()
+                            .map(|v| cam.world_to_screen(*v) * dpr)
+                            .collect();
+                        lines.polyline(&pts, color, dpr);
+                    }
+                } else {
+                    for l in &h.loops {
+                        let pts: Vec<Vec2> = l
+                            .vertices
+                            .iter()
+                            .map(|v| cam.world_to_screen(*v) * dpr)
+                            .collect();
+                        lines.polyline(&pts, color, dpr);
+                    }
+                }
+            }
+            _ => {}
+        }
+
         let Some(curve) = e.as_curve() else { continue };
         if !curve.bounds().overlaps(view) {
             continue;
@@ -588,109 +705,158 @@ pub fn build_geometry(app: &App, dpr: f32) -> (Batch2d, Batch3d, Vec<UiVertex>) 
             &curve,
             &cad_geom::tessellate::TessellationOptions::with_tolerance(tolerance),
         );
-        let selected = selection.contains(&id);
-        let hovered = hover == Some(id);
-        let color = if selected {
-            theme.selection
-        } else {
-            let lc = app.session.doc.layers.color_of(e.layer(), theme.text);
-            e.resolved_color(lc)
-        };
-        let col = if hovered { theme.highlight } else { color };
-        let width = if hovered || selected { 2.5 } else { 1.5 };
-        for w in pts.windows(2) {
-            lines.segment(
-                cam.world_to_screen(w[0]) * dpr,
-                cam.world_to_screen(w[1]) * dpr,
-                col,
-                width * dpr,
-            );
-        }
+        let screen: Vec<Vec2> = pts.iter().map(|w| cam.world_to_screen(*w) * dpr).collect();
+        // Off-canvas segments still cost vertices, so clip the polyline to the
+        // canvas rect before pushing it.
+        // `Rect2` has no `Mul<f32>`, and the canvas is in CSS pixels while the
+        // screen-space points are already in device pixels, so scale the rect
+        // explicitly.
+        let clip_rect = Rect2::from_xywh(
+            canvas.min.x * dpr,
+            canvas.min.y * dpr,
+            canvas.width() * dpr,
+            canvas.height() * dpr,
+        );
+        clip_polyline(&screen, clip_rect, |a, b| {
+            lines.segment(a, b, color, width * dpr)
+        });
     }
-
-    let mut rects: Vec<Rect2> = app.session.tool.preview();
-    if let Some((a, b)) = app.session.window_drag {
-        rects.push(Rect2::new(a, b));
-    }
-    for r in rects {
-        stroke_world_rect(&mut lines, &cam, r, dpr, theme.rubber_band);
-    }
-
-    // Panels.
-    let full_w = panels.properties.max.x;
-    let full_h = (panels.status_bar.max.y).max(panels.command_line.max.y);
-    push_rect(
-        &mut ui,
-        0.0,
-        0.0,
-        full_w * dpr,
-        panels.ribbon.height() * dpr,
-        theme.background,
-    );
-    push_rect(
-        &mut ui,
-        0.0,
-        panels.layer_panel.min.y * dpr,
-        panels.layer_panel.width() * dpr,
-        panels.layer_panel.height() * dpr,
-        theme.background,
-    );
-    push_rect(
-        &mut ui,
-        panels.properties.min.x * dpr,
-        panels.properties.min.y * dpr,
-        panels.properties.width() * dpr,
-        panels.properties.height() * dpr,
-        theme.background,
-    );
-    push_rect(
-        &mut ui,
-        0.0,
-        panels.command_line.min.y * dpr,
-        full_w * dpr,
-        (full_h - panels.command_line.min.y) * dpr,
-        theme.background,
-    );
-
-    // Separators.
-    let seps = [
-        (
-            Vec2::new(panels.canvas.min.x * dpr, 0.0),
-            Vec2::new(panels.canvas.min.x * dpr, full_h * dpr),
-        ),
-        (
-            Vec2::new(panels.properties.min.x * dpr, 0.0),
-            Vec2::new(panels.properties.min.x * dpr, full_h * dpr),
-        ),
-        (
-            Vec2::new(0.0, panels.ribbon.max.y * dpr),
-            Vec2::new(full_w * dpr, panels.ribbon.max.y * dpr),
-        ),
-        (
-            Vec2::new(0.0, panels.command_line.min.y * dpr),
-            Vec2::new(full_w * dpr, panels.command_line.min.y * dpr),
-        ),
-    ];
-    for (a, b) in seps {
-        lines.segment(a, b, theme.border, dpr);
-    }
-
-    // Crosshair.
-    if c.contains(app.input.mouse) {
-        let m = app.input.mouse * dpr;
-        let (x0, y0) = (c.min.x * dpr, c.min.y * dpr);
-        let (x1, y1) = (c.max.x * dpr, c.max.y * dpr);
-        lines.segment(Vec2::new(x0, m.y), Vec2::new(x1, m.y), theme.grid, dpr);
-        lines.segment(Vec2::new(m.x, y0), Vec2::new(m.x, y1), theme.grid, dpr);
-        if let Some(base) = app.session.tracking_base {
-            lines.segment(cam.world_to_screen(base) * dpr, m, theme.rubber_band, dpr);
-        }
-    }
-
-    (lines, solids, ui)
 }
 
-fn stroke_world_rect(lines: &mut Batch2d, cam: &Camera2D, r: Rect2, dpr: f32, color: Rgba) {
+/// Sutherland-Hodgman clip of a polyline to `rect`, emitting each kept run.
+///
+/// A drawing can extend far outside the viewport; uploading every tessellated
+/// point would make the frame cost scale with the document rather than with what
+/// is visible.
+fn clip_polyline<F: FnMut(Vec2, Vec2)>(pts: &[Vec2], rect: Rect2, mut emit: F) {
+    if pts.is_empty() {
+        return;
+    }
+    let inside = |p: Vec2| rect.contains(p);
+    let mut run: Vec<Vec2> = Vec::new();
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let (a_in, b_in) = (inside(a), inside(b));
+        if a_in && b_in {
+            if run.is_empty() {
+                run.push(a);
+            }
+            run.push(b);
+            continue;
+        }
+        if run.len() >= 2 {
+            for p in run.windows(2) {
+                emit(p[0], p[1]);
+            }
+        }
+        run.clear();
+        if a_in != b_in
+            && let Some(p) = clip_segment_to_rect(a, b, rect)
+        {
+            run.push(if a_in { b } else { a });
+            run.push(p);
+        }
+    }
+    if run.len() >= 2 {
+        for p in run.windows(2) {
+            emit(p[0], p[1]);
+        }
+    }
+}
+
+/// Liang-Barsky clip of one segment against `rect`; `None` when fully outside.
+fn clip_segment_to_rect(a: Vec2, b: Vec2, rect: Rect2) -> Option<Vec2> {
+    let d = b - a;
+    let mut t0 = 0.0f32;
+    let mut t1 = 1.0f32;
+    for (p, q) in [
+        (-d.x, a.x - rect.min.x),
+        (d.x, rect.max.x - a.x),
+        (-d.y, a.y - rect.min.y),
+        (d.y, rect.max.y - a.y),
+    ] {
+        if p.abs() < 1e-9 {
+            if q < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let t = q / p;
+        if p < 0.0 {
+            if t > t1 {
+                return None;
+            }
+            t0 = t0.max(t);
+        } else {
+            if t < t0 {
+                return None;
+            }
+            t1 = t1.min(t);
+        }
+    }
+    Some(a + d * (t0 + t1) * 0.5)
+}
+
+/// An X mark, the conventional symbol for a point entity.
+fn draw_cross_mark(lines: &mut Batch2d, p: Vec2, r: f32, color: cad_core::Rgba, w: f32) {
+    lines.segment(p - Vec2::new(r, r), p + Vec2::new(r, r), color, w);
+    lines.segment(p - Vec2::new(r, -r), p + Vec2::new(r, -r), color, w);
+}
+
+/// A square snap marker, the AutoCAD convention for object snaps.
+fn draw_snap_marker(
+    lines: &mut Batch2d,
+    cam: &Camera2D,
+    world: Vec2,
+    dpr: f32,
+    color: cad_core::Rgba,
+) {
+    let p = cam.world_to_screen(world) * dpr;
+    let r = 6.0 * dpr;
+    lines.segment(p - Vec2::new(r, 0.0), p + Vec2::new(r, 0.0), color, dpr);
+    lines.segment(p - Vec2::new(0.0, r), p + Vec2::new(0.0, r), color, dpr);
+}
+
+/// Text as stroked glyphs through the built-in font, positioned and scaled in world space.
+fn draw_text_entity(
+    lines: &mut Batch2d,
+    cam: &Camera2D,
+    t: &cad_doc::Text,
+    dpr: f32,
+    color: cad_core::Rgba,
+    _theme: Theme,
+) {
+    // Glyph strokes are in font units; project the unit box through the camera so
+    // the text tracks zoom and rotation exactly like any other geometry.
+    let scale = cam.scale * t.height.max(1e-3) / cad_ui::font::UNITS_H;
+    let (s, c) = t.rotation.sin_cos();
+    let ox = t.insert.x;
+    let oy = t.insert.y;
+    for ch in t.value.chars() {
+        let g = cad_ui::font::glyph(ch);
+        for stroke in g.strokes {
+            for pair in stroke.windows(2) {
+                let pts: Vec<Vec2> = [pair[0], pair[1]]
+                    .iter()
+                    .map(|p| {
+                        let wx = ox + (p.0 * c - p.1 * s) * scale;
+                        let wy = oy + (p.0 * s + p.1 * c) * scale;
+                        cam.world_to_screen(Vec2::new(wx, wy)) * dpr
+                    })
+                    .collect();
+                lines.segment(pts[0], pts[1], color, dpr);
+            }
+        }
+    }
+}
+
+fn stroke_world_rect(
+    lines: &mut Batch2d,
+    cam: &Camera2D,
+    r: Rect2,
+    dpr: f32,
+    color: cad_core::Rgba,
+) {
     let a = cam.world_to_screen(r.min) * dpr;
     let b = cam.world_to_screen(r.max) * dpr;
     lines.segment(a, Vec2::new(b.x, a.y), color, dpr);
@@ -705,7 +871,7 @@ fn draw_grid(
     canvas: Rect2,
     dpr: f32,
     vp: &cad_app::session::Viewport,
-    color: Rgba,
+    color: cad_core::Rgba,
 ) {
     let step = vp.grid_spacing;
     if step <= 0.0 {
@@ -715,9 +881,12 @@ fn draw_grid(
         return;
     }
     let view = cam.world_viewport();
+    // The 512 cap bounds a pathological zoom-out; past that the grid is denser
+    // than a pixel anyway and drawing it costs more than it shows.
+    const MAX: usize = 512;
     let mut x = (view.min.x / step).floor() * step;
     let mut n = 0;
-    while x <= view.max.x && n < 512 {
+    while x <= view.max.x && n < MAX {
         let sx = cam.world_to_screen(Vec2::new(x, 0.0)).x * dpr;
         lines.segment(
             Vec2::new(sx, canvas.min.y * dpr),
@@ -730,7 +899,7 @@ fn draw_grid(
     }
     let mut y = (view.min.y / step).floor() * step;
     let mut n = 0;
-    while y <= view.max.y && n < 512 {
+    while y <= view.max.y && n < MAX {
         let sy = cam.world_to_screen(Vec2::new(0.0, y)).y * dpr;
         lines.segment(
             Vec2::new(canvas.min.x * dpr, sy),
@@ -756,6 +925,35 @@ fn draw_axes(lines: &mut Batch2d, origin: Vec2, canvas: Rect2, dpr: f32, theme: 
         theme.axis_y,
         dpr,
     );
+}
+
+const fn identity_mat4() -> [[f32; 4]; 4] {
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+/// A short, fixed label for the status bar.
+///
+/// `AdapterInfo` is not `'static`, so the name is copied once and interned as a
+/// leaked string: it is at most a few dozen bytes and it must outlive the frame
+/// that formats it.
+fn adapter_label(gpu: &Gpu) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
+    let key = format!("{:?}", gpu.adapter_info.name);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(HashMap::new);
+    if let Some(s) = map.get(&key) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(key.clone().into_boxed_str());
+    map.insert(key, leaked);
+    leaked
 }
 
 fn map_button(b: winit::event::MouseButton) -> MouseButton {
@@ -792,6 +990,10 @@ fn named_key(n: &winit::keyboard::NamedKey) -> Option<Key> {
     use winit::keyboard::NamedKey as N;
     Some(match n {
         N::Escape => Key::Escape,
+        // winit 0.30 reports punctuation and the numpad's non-digit keys as
+        // `Key::Character`, not as `NamedKey` variants -- there is no
+        // `NumpadEnter`, `Minus` or `Slash` in the enum. They arrive through
+        // `char_to_key` instead.
         N::Enter => Key::Enter,
         N::Tab => Key::Tab,
         N::Backspace => Key::Backspace,
@@ -848,7 +1050,8 @@ fn char_to_key(c: char) -> Option<Key> {
         'p' => P,
         'q' => Q,
         'r' => R,
-        's' => T,
+        's' => S,
+        't' => T,
         'u' => U,
         'v' => V,
         'w' => W,
@@ -956,6 +1159,10 @@ pub fn main_loop() -> Result<Option<String>, Box<dyn std::error::Error>> {
 /// Returns `false` if either step failed, having already asked the event loop to
 /// exit, so the caller does not have to.
 fn create_window(elwt: &winit::event_loop::ActiveEventLoop, slot: &mut Option<App>) -> bool {
+    // A file named on the command line is opened before the first frame, so
+    // double-clicking a .cad or .dxf works.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+
     let attrs = winit::window::WindowAttributes::default()
         .with_title("CADKit")
         .with_inner_size(winit::dpi::LogicalSize::new(1600.0, 900.0))
@@ -981,6 +1188,19 @@ fn create_window(elwt: &winit::event_loop::ActiveEventLoop, slot: &mut Option<Ap
                 "cadkit: started on {:?} ({:?}, {:?})",
                 app.gpu.adapter_info.backend, app.gpu.adapter_info.name, app.gpu.format
             );
+            if let Some(path) = argv.first() {
+                let r = app.session.open(std::path::Path::new(path));
+                match r {
+                    CommandResult::Ok => {
+                        eprintln!("cadkit: opened {path}");
+                    }
+                    CommandResult::Error(m) => {
+                        eprintln!("cadkit: could not open {path}: {m}");
+                    }
+                    _ => {}
+                }
+                app.relayout();
+            }
             *slot = Some(app);
             true
         }
@@ -997,58 +1217,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn panels_tile_the_window_without_gaps() {
-        let p = Panels::layout(1600.0, 900.0);
-        assert_eq!(p.ribbon.max.y, p.canvas.min.y);
-        assert_eq!(p.canvas.min.x, p.layer_panel.max.x);
-        assert_eq!(p.canvas.max.x, p.properties.min.x);
-        assert_eq!(p.canvas.max.y, p.command_line.min.y);
-        assert_eq!(p.command_line.max.y, p.status_bar.min.y);
+    fn clip_keeps_a_segment_inside() {
+        let r = Rect2::from_xywh(0.0, 0.0, 100.0, 100.0);
+        let p = clip_segment_to_rect(Vec2::new(10.0, 10.0), Vec2::new(20.0, 20.0), r).unwrap();
+        assert!(r.contains(p), "{p:?}");
     }
 
     #[test]
-    fn canvas_never_overlaps_a_panel() {
-        let p = Panels::layout(1200.0, 800.0);
-        assert!(p.canvas.contains(Vec2::new(600.0, 400.0)));
-        // The panels tile edge to edge and `Rect2::overlaps` is inclusive, so a
-        // shared border counts as overlap. What must not happen is the canvas
-        // covering any panel's area.
-        for panel in [
-            p.layer_panel,
-            p.properties,
-            p.ribbon,
-            p.command_line,
-            p.status_bar,
-        ] {
-            assert!(
-                !p.canvas.intersect(panel).has_area(),
-                "canvas and {panel:?} share area"
-            );
-        }
+    fn clip_truncates_a_crossing_segment() {
+        let r = Rect2::from_xywh(0.0, 0.0, 100.0, 100.0);
+        // Starts outside on the left, ends inside: the clipped point must be on
+        // the left edge, not the midpoint.
+        let p = clip_segment_to_rect(Vec2::new(-100.0, 50.0), Vec2::new(50.0, 50.0), r).unwrap();
+        assert!((p.x - 0.0).abs() < 1e-3, "{p:?}");
+        assert!((p.y - 50.0).abs() < 1e-3, "{p:?}");
     }
 
     #[test]
-    fn panels_survive_a_tiny_window() {
-        for (w, h) in [(100.0f32, 50.0f32), (10.0, 10.0), (0.0, 0.0)] {
-            let p = Panels::layout(w, h);
-            assert!(p.canvas.width() >= 0.0, "{w}x{h}");
-            assert!(p.canvas.height() >= 0.0, "{w}x{h}");
-            assert!(p.layer_panel.width() >= 0.0, "{w}x{h}");
-            assert!(p.properties.min.x >= 0.0, "{w}x{h}");
-        }
+    fn clip_rejects_a_fully_outside_segment() {
+        let r = Rect2::from_xywh(0.0, 0.0, 10.0, 10.0);
+        assert!(
+            clip_segment_to_rect(Vec2::new(100.0, 100.0), Vec2::new(200.0, 200.0), r).is_none()
+        );
     }
 
     #[test]
-    fn panels_handle_a_very_wide_window() {
-        let p = Panels::layout(5000.0, 400.0);
-        assert!(p.canvas.width() > p.layer_panel.width());
-        assert!((p.layer_panel.width() - 240.0).abs() < 1e-3);
+    fn clipping_emits_the_inside_runs() {
+        let r = Rect2::from_xywh(0.0, 0.0, 100.0, 100.0);
+        let pts = [
+            Vec2::new(-50.0, 50.0),
+            Vec2::new(50.0, 50.0),
+            Vec2::new(150.0, 50.0),
+        ];
+        let mut n = 0;
+        clip_polyline(&pts, r, |_, _| n += 1);
+        assert_eq!(n, 1, "one visible run inside the rect");
     }
 
     #[test]
-    fn status_bar_ends_at_the_window_bottom() {
-        let p = Panels::layout(1600.0, 900.0);
-        assert!((p.status_bar.max.y - 900.0).abs() < 1e-3);
+    fn clipping_an_entirely_outside_polyline_emits_nothing() {
+        let r = Rect2::from_xywh(0.0, 0.0, 10.0, 10.0);
+        let pts = [Vec2::new(100.0, 100.0), Vec2::new(200.0, 200.0)];
+        let mut n = 0;
+        clip_polyline(&pts, r, |_, _| n += 1);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn clipping_a_closed_inside_polyline_keeps_every_edge() {
+        let r = Rect2::from_xywh(0.0, 0.0, 100.0, 100.0);
+        let pts = [
+            Vec2::new(10.0, 10.0),
+            Vec2::new(90.0, 10.0),
+            Vec2::new(90.0, 90.0),
+            Vec2::new(10.0, 90.0),
+        ];
+        let mut n = 0;
+        clip_polyline(&pts, r, |_, _| n += 1);
+        assert_eq!(n, 3);
     }
 
     #[test]
@@ -1068,7 +1294,7 @@ mod tests {
         // Uppercase arrives as one character and must fold to the same key, or
         // Shift+letter would stop working.
         assert_eq!(map_key(&W::Character("L".into())), Some(Key::L));
-        // Punctuation has no Key variant, so it is dropped rather than guessed at.
+        // Punctuation has no printable-Key path other than the named ones.
         assert_eq!(map_key(&W::Character("%".into())), None);
     }
 
@@ -1083,5 +1309,26 @@ mod tests {
         // Left and right both report the same logical key, which is what makes
         // Ctrl+Z work from either side.
         assert_eq!(map_key(&W::Named(N::Alt)), Some(Key::Alt));
+    }
+
+    #[test]
+    fn digits_map_from_characters_not_named_keys() {
+        // winit 0.30 dropped every punctuation NamedKey and the numpad's
+        // non-digit keys: `-`, `.`, `/` and numpad-enter all arrive as
+        // `Key::Character`. This pins that, because restoring named arms for
+        // them would not compile and would mean someone read the enum wrong.
+        use winit::keyboard::Key as W;
+        for (s, want) in [
+            ("-", Key::Minus),
+            (".", Key::Period),
+            (",", Key::Comma),
+            ("/", Key::Slash),
+            ("7", Key::Num7),
+        ] {
+            assert_eq!(map_key(&W::Character(s.into())), Some(want), "{s}");
+        }
+        // Anything with no Key variant is dropped rather than guessed at.
+        assert_eq!(map_key(&W::Character("%".into())), None);
+        assert_eq!(map_key(&W::Character("é".into())), None);
     }
 }

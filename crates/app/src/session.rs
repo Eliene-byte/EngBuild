@@ -492,6 +492,356 @@ impl Session {
         }
         (planar, solid)
     }
+
+    // ----------------------------------------------------------------- files
+
+    /// Load `path` into this session, replacing the drawing.
+    ///
+    /// The format is chosen by extension: `.dxf` goes through the DXF reader,
+    /// everything else through the native container. Doing it by extension
+    /// rather than by sniffing means a `.dxf` that is actually a project file
+    /// fails loudly instead of importing as an empty drawing.
+    pub fn open(&mut self, path: &std::path::Path) -> CommandResult {
+        let is_dxf = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("dxf"));
+        let doc = if is_dxf {
+            let mut doc = Document::new();
+            match cad_io::import(&mut doc, path) {
+                Ok(report) => {
+                    self.status = StatusMessage::success(format!(
+                        "Opened {} ({} entities, {} layers)",
+                        display_name(path),
+                        report.entities,
+                        report.layers
+                    ));
+                }
+                Err(e) => {
+                    self.status =
+                        StatusMessage::error(format!("Cannot open {}: {e}", path.display()));
+                    return CommandResult::Error(e.to_string());
+                }
+            }
+            doc
+        } else {
+            match cad_io::load(path) {
+                Ok(doc) => {
+                    self.status = StatusMessage::success(format!("Opened {}", display_name(path)));
+                    doc
+                }
+                Err(e) => {
+                    self.status =
+                        StatusMessage::error(format!("Cannot open {}: {e}", path.display()));
+                    return CommandResult::Error(e.to_string());
+                }
+            }
+        };
+
+        // Swap the drawing in. Layer and block tables come from the file, so they
+        // replace the session's rather than merging with it.
+        self.doc = doc;
+        self.doc.entities.rebuild_index(index_bounds(&self.doc));
+        self.history = History::new();
+        self.tool.selection.clear();
+        self.tool.hovered = None;
+        self.tool.finish();
+        self.path = Some(path.to_path_buf());
+        self.dirty = false;
+        self.viewport.cam3d = cam3d_framing(&self.doc);
+        self.viewport.refresh_target();
+        self.zoom_extents();
+        CommandResult::Ok
+    }
+
+    /// Save to `path`, or to the current path if none is given.
+    pub fn save(&mut self, path: Option<&std::path::Path>) -> CommandResult {
+        let target = match path.or(self.path.as_deref()) {
+            Some(p) => p.to_path_buf(),
+            None => {
+                self.status = StatusMessage::error("No file name - use SAVEAS <path>");
+                return CommandResult::Unavailable;
+            }
+        };
+        let result = if target
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("dxf"))
+        {
+            cad_io::dxf::save(&self.doc, &target).map_err(|e| e.to_string())
+        } else {
+            cad_io::save(&self.doc, &target).map_err(|e| e.to_string())
+        };
+        match result {
+            Ok(()) => {
+                self.path = Some(target.clone());
+                self.dirty = false;
+                self.status = StatusMessage::success(format!("Saved {}", display_name(&target)));
+                CommandResult::Ok
+            }
+            Err(e) => {
+                self.status =
+                    StatusMessage::error(format!("Cannot save {}: {e}", target.display()));
+                CommandResult::Error(e)
+            }
+        }
+    }
+
+    /// Write a DXF of the current drawing without changing the session path.
+    pub fn export_dxf(&mut self, path: &std::path::Path) -> CommandResult {
+        match cad_io::dxf::save(&self.doc, path) {
+            Ok(()) => {
+                self.status = StatusMessage::success(format!("Exported {}", display_name(path)));
+                CommandResult::Ok
+            }
+            Err(e) => {
+                self.status =
+                    StatusMessage::error(format!("Cannot export {}: {e}", path.display()));
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    /// Parse and run one command line, with arguments.
+    ///
+    /// `line` is a command name followed by optional arguments, e.g.
+    /// `open plan.dxf` or `undo 3`. File commands take a path argument because
+    /// there is no native file dialog: the user types it, and the error from a
+    /// bad path comes back through the status bar rather than a modal.
+    pub fn run_command_line(&mut self, line: &str) -> CommandResult {
+        let line = line.trim();
+        if line.is_empty() {
+            return CommandResult::Ok;
+        }
+        let mut parts = line.split_whitespace();
+        let name = parts.next().unwrap_or("").to_ascii_lowercase();
+        let arg = parts.next().unwrap_or("");
+        let extra: Vec<&str> = parts.collect();
+        // `open a.dxf b.dxf` is a typo, not a request to ignore an argument.
+        if !extra.is_empty() && !matches!(name.as_str(), "undo" | "redo") {
+            self.status =
+                StatusMessage::error(format!("{name} takes at most one argument: {line}"));
+            return CommandResult::Error(format!("unexpected argument in `{line}`"));
+        }
+
+        match name.as_str() {
+            "open" | "o" => {
+                if arg.is_empty() {
+                    self.status = StatusMessage::prompt("Specify a file to open");
+                    return CommandResult::Unavailable;
+                }
+                self.open(std::path::Path::new(arg))
+            }
+            "save" => self.save(None),
+            "saveas" => {
+                if arg.is_empty() {
+                    self.status = StatusMessage::prompt("Specify a file name");
+                    return CommandResult::Unavailable;
+                }
+                self.save(Some(std::path::Path::new(arg)))
+            }
+            "export" => {
+                if arg.is_empty() {
+                    self.status = StatusMessage::prompt("Specify a DXF to write");
+                    return CommandResult::Unavailable;
+                }
+                self.export_dxf(std::path::Path::new(arg))
+            }
+            "new" | "_new" => {
+                self.new_document();
+                CommandResult::Ok
+            }
+            "undo" | "u" => {
+                let n: usize = arg.parse().unwrap_or(1);
+                for _ in 0..n.max(1) {
+                    if !self.undo().is_ok() {
+                        break;
+                    }
+                }
+                CommandResult::Ok
+            }
+            "redo" => {
+                let n: usize = arg.parse().unwrap_or(1);
+                for _ in 0..n.max(1) {
+                    if !self.redo().is_ok() {
+                        break;
+                    }
+                }
+                CommandResult::Ok
+            }
+            "zoomall" | "z" => {
+                self.zoom_extents();
+                CommandResult::Ok
+            }
+            "zoomin" => {
+                self.zoom_by(1.25);
+                CommandResult::Ok
+            }
+            "zoomout" => {
+                self.zoom_by(1.0 / 1.25);
+                CommandResult::Ok
+            }
+            "view3d" => self.toggle_3d(),
+            "grid" => self.toggle_grid(),
+            "snap" => self.toggle_snap(),
+            "ortho" => self.toggle_ortho(),
+            "polar" => self.toggle_polar(),
+            "layer" | "la" => {
+                if arg.is_empty() {
+                    let c = self.doc.current_layer();
+                    self.status =
+                        StatusMessage::info(format!("Current layer: {}", self.doc.layers.name(c)));
+                    return CommandResult::Ok;
+                }
+                match self.doc.layers.by_name(arg) {
+                    Some(id) => {
+                        self.set_current_layer(id);
+                        CommandResult::Ok
+                    }
+                    None => {
+                        self.add_layer(arg);
+                        CommandResult::Ok
+                    }
+                }
+            }
+            "selectall" | "all" => {
+                self.select_all();
+                CommandResult::Ok
+            }
+            "erase" | "e" | "del" | "delete" => self.delete_selection(),
+            "help" | "?" | "??" => {
+                self.status = StatusMessage::info(format!(
+                    "{} commands. Try: line, circle, arc, polyline, rectangle, move, copy, \
+                     rotate, mirror, trim, offset, extrude, zoomall, view3d, layer <name>, \
+                     open <file>, save [file], export <file.dxf>, undo [n]",
+                    self.commands.len()
+                ));
+                CommandResult::Ok
+            }
+            "about" => {
+                self.status = StatusMessage::info(concat!(
+                    "CADKit - native 2D/3D CAD on wgpu. ",
+                    "Analytic geometry, transactional undo, DXF interchange."
+                ));
+                CommandResult::Ok
+            }
+            other => {
+                if self.commands.get(other).is_some() || tool_for_command(other).is_some() {
+                    self.activate(other)
+                } else {
+                    self.status = StatusMessage::error(format!("Unknown command: {other}"));
+                    CommandResult::Error(format!("Unknown command: {other}"))
+                }
+            }
+        }
+    }
+
+    /// Start an empty drawing.
+    pub fn new_document(&mut self) {
+        let theme = self.theme;
+        let cam2d = self.viewport.cam2d;
+        let canvas = self.viewport.canvas;
+        *self = Session::new();
+        self.theme = theme;
+        self.viewport.cam2d = cam2d;
+        self.viewport.canvas = canvas;
+        self.viewport.refresh_target();
+        self.path = None;
+        self.status = StatusMessage::success("New drawing");
+    }
+
+    // ---------------------------------------------------------------- layers
+
+    /// Flip a layer's visibility and report it.
+    pub fn toggle_layer_visibility(&mut self, id: cad_doc::LayerId) {
+        let now = self.doc.layers.by_id(id).is_some_and(|l| l.visible);
+        self.doc.layers.set_visible(id, !now);
+        self.doc.invalidate_extents();
+        self.dirty = true;
+        self.status = StatusMessage::info(format!(
+            "Layer {} {}",
+            self.doc.layers.name(id),
+            if now { "hidden" } else { "shown" }
+        ));
+    }
+
+    pub fn toggle_layer_lock(&mut self, id: cad_doc::LayerId) {
+        let now = self.doc.layers.by_id(id).is_some_and(|l| l.locked);
+        self.doc.layers.set_locked(id, !now);
+        self.dirty = true;
+        self.status = StatusMessage::info(format!(
+            "Layer {} {}",
+            self.doc.layers.name(id),
+            if now { "unlocked" } else { "locked" }
+        ));
+    }
+
+    /// Add a layer with a fresh name and make it current.
+    pub fn add_layer(&mut self, name: &str) {
+        let mut n = name.trim().to_string();
+        if n.is_empty() {
+            n = format!("Layer{}", self.doc.layers.len() + 1);
+        }
+        // `insert` de-duplicates by name, so a collision silently reuses the
+        // existing layer. Append a suffix until it is genuinely new.
+        let mut candidate = n.clone();
+        let mut n_suffix = 1;
+        while self.doc.layers.by_name(&candidate).is_some() {
+            candidate = format!("{n}{n_suffix}");
+            n_suffix += 1;
+        }
+        let id = self.doc.layers.insert(cad_doc::Layer::new(&candidate));
+        self.doc.set_current_layer(id);
+        self.dirty = true;
+        self.status = StatusMessage::success(format!("Layer {candidate} created"));
+    }
+
+    pub fn set_current_layer(&mut self, id: cad_doc::LayerId) {
+        self.doc.set_current_layer(id);
+        self.dirty = true;
+        self.status = StatusMessage::info(format!("Current layer: {}", self.doc.layers.name(id)));
+    }
+}
+
+/// File name for a status message: the last path component, so the message stays
+/// readable in a narrow status bar.
+fn display_name(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+/// A world rectangle big enough to hold every entity, for the spatial index.
+///
+/// An empty document has no extents, so this falls back to a fixed window around
+/// the origin rather than an empty rect, which would make every pick miss.
+fn index_bounds(doc: &Document) -> Rect2 {
+    match doc.compute_extents() {
+        Some((bb, _)) => {
+            let r = Rect2::new(bb.min.xy(), bb.max.xy());
+            r.expand(Vec2::splat(1.0).max(r.size() * 0.05))
+        }
+        None => Rect2::from_xywh(-1000.0, -1000.0, 2000.0, 2000.0),
+    }
+}
+
+/// A 3D camera framing the whole drawing, used when entering the model view.
+fn cam3d_framing(doc: &Document) -> Camera3D {
+    let mut cam = Camera3D::default();
+    match doc.compute_extents() {
+        Some((bb, c)) => {
+            let r = bb.size().length().max(1.0);
+            cam.target = c;
+            cam.eye = c + Vec3::new(r * 0.5, -r * 0.5, r * 0.4);
+            cam.near = (r * 0.01).max(0.01);
+            cam.far = r * 20.0;
+        }
+        None => {
+            cam.eye = Vec3::new(100.0, -100.0, 80.0);
+            cam.far = 5000.0;
+        }
+    }
+    cam
 }
 
 /// Map a command name to a tool.
@@ -835,5 +1185,264 @@ mod tests {
         s.zoom_to_entities(&[EntityId(0)]);
         let v = s.viewport.cam2d.world_viewport();
         assert!(v.contains(Vec2::ZERO), "{v:?}");
+    }
+
+    // -------------------------------------------------------------- layers
+
+    #[test]
+    fn a_new_layer_becomes_current() {
+        let mut s = Session::new();
+        let before = s.doc.current_layer();
+        s.add_layer("walls");
+        let after = s.doc.current_layer();
+        assert_ne!(before, after);
+        assert_eq!(s.doc.layers.name(after), "walls");
+        assert_eq!(s.doc.layers.len(), 2);
+    }
+
+    #[test]
+    fn adding_a_duplicate_layer_name_gets_a_suffix() {
+        let mut s = Session::new();
+        s.add_layer("walls");
+        let first = s.doc.current_layer();
+        s.add_layer("walls");
+        let second = s.doc.current_layer();
+        assert_ne!(
+            first, second,
+            "insert() de-duplicates, so the second must not alias"
+        );
+        assert_eq!(s.doc.layers.name(second), "walls1");
+    }
+
+    #[test]
+    fn an_empty_layer_name_gets_a_default() {
+        let mut s = Session::new();
+        s.add_layer("");
+        assert!(
+            s.doc
+                .layers
+                .name(s.doc.current_layer())
+                .starts_with("Layer")
+        );
+    }
+
+    #[test]
+    fn layer_visibility_toggles_and_reports() {
+        let mut s = Session::new();
+        let id = s.add_layer("hidden-me");
+        let id = s.doc.current_layer();
+        assert!(s.doc.layers.visible(id));
+        s.toggle_layer_visibility(id);
+        assert!(!s.doc.layers.visible(id));
+        assert!(s.status.text.contains("hidden-me"), "{:?}", s.status.text);
+        s.toggle_layer_visibility(id);
+        assert!(s.doc.layers.visible(id));
+    }
+
+    #[test]
+    fn layer_lock_toggles_and_reports() {
+        let mut s = Session::new();
+        s.add_layer("locked");
+        let id = s.doc.current_layer();
+        assert!(!s.doc.layers.locked(id));
+        s.toggle_layer_lock(id);
+        assert!(s.doc.layers.locked(id));
+        assert!(s.status.text.contains("locked"), "{:?}", s.status.text);
+    }
+
+    #[test]
+    fn new_geometry_lands_on_the_current_layer() {
+        // The layer panel is only worth anything if drawing respects it.
+        let mut s = Session::new();
+        s.add_layer("wires");
+        let layer = s.doc.current_layer();
+        assert!(s.activate("line").is_ok());
+        s.click_world(Vec2::ZERO, false);
+        s.click_world(Vec2::new(10.0, 0.0), false);
+        let e = s.doc.entities.iter().next().expect("an entity");
+        assert_eq!(e.layer(), layer);
+    }
+
+    #[test]
+    fn a_stale_current_layer_falls_back_to_layer_zero() {
+        let mut s = Session::new();
+        // Point the handle at a layer that does not exist.
+        s.doc.set_current_layer(cad_doc::LayerId(999));
+        assert_eq!(
+            s.doc.current_layer(),
+            s.doc.layers.default_layer(),
+            "a stale handle must not strand new geometry"
+        );
+    }
+
+    // --------------------------------------------------------------- files
+
+    #[test]
+    fn save_then_open_round_trips_the_drawing() {
+        let dir = std::env::temp_dir().join(format!("cadkit-io-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("round.cad");
+
+        let mut s = session_with_circle();
+        s.add_layer("round");
+        s.set_current_layer(s.doc.current_layer());
+        s.doc.set_name("round.cad");
+        assert!(s.save(Some(&path)).is_ok());
+        assert_eq!(s.path.as_deref(), Some(path.as_path()));
+        assert!(!s.dirty, "a successful save clears the dirty flag");
+
+        let mut other = Session::new();
+        assert!(other.open(&path).is_ok());
+        assert_eq!(other.doc.entities.len(), 1);
+        assert!(
+            other.doc.layers.by_name("round").is_some(),
+            "layers must survive the round trip"
+        );
+        assert_eq!(other.status.level, Level::Info);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opening_a_missing_file_reports_and_keeps_the_document() {
+        let mut s = session_with_circle();
+        let r = s.open(std::path::Path::new("definitely-not-here.cad"));
+        assert!(!r.is_ok());
+        assert_eq!(s.status.level, Level::Error);
+        assert_eq!(
+            s.doc.entities.len(),
+            1,
+            "a failed open must not clear the drawing"
+        );
+        assert!(s.path.is_none());
+    }
+
+    #[test]
+    fn saving_without_a_name_asks_for_one() {
+        let mut s = Session::new();
+        assert_eq!(s.save(None), CommandResult::Unavailable);
+        assert!(s.status.text.contains("SAVEAS"), "{:?}", s.status.text);
+    }
+
+    #[test]
+    fn export_writes_a_dxf() {
+        let dir = std::env::temp_dir().join(format!("cadkit-dxf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.dxf");
+        let mut s = session_with_circle();
+        assert!(s.export_dxf(&path).is_ok());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("CIRCLE"),
+            "the export must contain the entity"
+        );
+        // Export must not repoint the session at the DXF: it is not the file
+        // being edited.
+        assert!(s.path.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_rebuilds_the_spatial_index() {
+        let dir = std::env::temp_dir().join(format!("cadkit-idx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idx.cad");
+        let mut s = session_with_circle();
+        assert!(s.save(Some(&path)).is_ok());
+
+        let mut other = Session::new();
+        assert!(other.open(&path).is_ok());
+        // Without a rebuilt index, hover and window selection would find nothing.
+        let hits = other
+            .doc
+            .entities
+            .candidates_in(Rect2::from_xywh(-50.0, -50.0, 200.0, 200.0));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_document_clears_everything_but_the_view() {
+        let mut s = session_with_circle();
+        s.path = Some("x.cad".into());
+        s.select_all();
+        s.zoom_extents();
+        let cam = s.viewport.cam2d;
+        s.new_document();
+        assert!(s.doc.entities.is_empty());
+        assert!(s.path.is_none());
+        assert!(s.tool.selection.is_empty());
+        assert!(!s.history.can_undo());
+        // The camera survives: a new drawing should not throw the user back to
+        // the origin.
+        assert_eq!(s.viewport.cam2d.center, cam.center);
+        assert!(s.status.text.contains("New"), "{:?}", s.status.text);
+    }
+
+    // ------------------------------------------------------- command line
+
+    #[test]
+    fn the_command_line_runs_named_commands() {
+        let mut s = session_with_circle();
+        assert!(s.run_command_line("line").is_ok());
+        assert_eq!(s.tool.id, ToolId::Line);
+    }
+
+    #[test]
+    fn the_command_line_reports_unknown_commands() {
+        let mut s = Session::new();
+        let r = s.run_command_line("wibble");
+        assert!(matches!(r, CommandResult::Error(_)));
+        assert_eq!(s.status.level, Level::Error);
+    }
+
+    #[test]
+    fn undo_takes_an_argument() {
+        let mut s = session_with_circle();
+        s.select_all();
+        s.delete_selection();
+        assert!(s.history.can_undo());
+        s.run_command_line("undo");
+        assert_eq!(s.doc.entities.len(), 1);
+    }
+
+    #[test]
+    fn too_many_arguments_is_an_error_not_a_silent_ignore() {
+        let mut s = Session::new();
+        let r = s.run_command_line("open a.cad b.cad");
+        assert!(
+            !r.is_ok(),
+            "a trailing argument must not be silently dropped"
+        );
+        assert!(s.status.text.contains("at most one"), "{:?}", s.status.text);
+    }
+
+    #[test]
+    fn layer_command_selects_or_creates() {
+        let mut s = Session::new();
+        assert!(s.run_command_line("layer walls").is_ok());
+        assert!(s.doc.layers.by_name("walls").is_some());
+        assert_eq!(
+            s.doc.current_layer(),
+            s.doc.layers.by_name("walls").unwrap()
+        );
+
+        // Querying reports the current layer.
+        assert!(s.run_command_line("layer").is_ok());
+        assert!(s.status.text.contains("walls"), "{:?}", s.status.text);
+    }
+
+    #[test]
+    fn an_empty_command_line_is_a_no_op() {
+        let mut s = Session::new();
+        assert!(s.run_command_line("   ").is_ok());
+        assert_eq!(s.tool.id, ToolId::Select);
+    }
+
+    #[test]
+    fn help_lists_the_command_count() {
+        let mut s = Session::new();
+        assert!(s.run_command_line("help").is_ok());
+        assert!(s.status.text.contains("commands"), "{:?}", s.status.text);
     }
 }

@@ -112,6 +112,15 @@ pub struct Ui<'a> {
     hot: Option<usize>,
     active: Option<usize>,
     hot_modifiers: Modifiers,
+    /// Device pixels per CSS pixel.
+    ///
+    /// Widgets are written in CSS pixels because that is the space the mouse
+    /// lives in, so hit-testing stays resolution independent. Everything pushed
+    /// to a batch is multiplied by this, because the batches are uploaded in
+    /// device pixels and the shaders divide by the framebuffer size. Getting
+    /// this wrong makes the whole chrome `dpr` times too small on a HiDPI
+    /// display while the canvas underneath stays the right size.
+    scale: f32,
 }
 
 impl<'a> Ui<'a> {
@@ -133,7 +142,43 @@ impl<'a> Ui<'a> {
             hot: None,
             active: None,
             hot_modifiers: Modifiers::NONE,
+            scale: 1.0,
         }
+    }
+
+    /// Emit geometry at `dpr` device pixels per CSS pixel.
+    pub fn with_scale(mut self, dpr: f32) -> Self {
+        self.scale = if dpr.is_finite() && dpr > 0.0 {
+            dpr
+        } else {
+            1.0
+        };
+        self
+    }
+
+    /// The current CSS -> device pixel factor.
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    #[inline]
+    fn s(&self, v: f32) -> f32 {
+        v * self.scale
+    }
+
+    #[inline]
+    fn sr(&self, r: Rect) -> Rect {
+        Rect::from_xywh(
+            self.s(r.min.x),
+            self.s(r.min.y),
+            self.s(r.width()),
+            self.s(r.height()),
+        )
+    }
+
+    #[inline]
+    fn sv(&self, v: Vec2) -> Vec2 {
+        Vec2::new(self.s(v.x), self.s(v.y))
     }
 
     /// Unique id for a widget this frame.
@@ -200,6 +245,7 @@ impl<'a> Ui<'a> {
         if r.is_empty() {
             return;
         }
+        let r = self.sr(r);
         push_rect(
             self.ui_batch,
             r.min.x,
@@ -214,10 +260,12 @@ impl<'a> Ui<'a> {
         if r.is_empty() {
             return;
         }
-        push_rounded_rect(self.ui_batch, r, color, radius);
+        push_rounded_rect(self.ui_batch, self.sr(r), color, self.s(radius));
     }
 
     pub fn stroke_rect(&mut self, r: Rect, color: Rgba, width: f32) {
+        let width = self.s(width);
+        let r = self.sr(r);
         let h = width * 0.5;
         // Four thin rects; cheaper and sharper than an SDF outline here.
         push_rect(self.ui_batch, r.min.x, r.min.y, r.width(), h, color);
@@ -256,27 +304,31 @@ impl<'a> Ui<'a> {
 
     /// [`Ui::text`] with an explicit cap height in pixels.
     pub fn text_sized(&mut self, s: &str, pos: Vec2, color: Rgba, size: f32) -> f32 {
+        // Geometry goes out in device pixels, so the pen, the unit and the
+        // stroke width all carry the same factor. The returned advance stays in
+        // CSS pixels because callers lay out with it.
         let unit = size / crate::font::UNITS_H;
-        let hairline = (size * 0.09).max(0.8);
-        let mut pen = pos;
+        let hairline = ((size * 0.09).max(0.8)) * self.scale;
+        let origin = self.sv(pos);
+        let mut pen = origin;
         for c in s.chars() {
             let g = crate::font::glyph(c);
             for stroke in g.strokes {
                 for pair in stroke.windows(2) {
-                    let a = Vec2::new(pos.x + pair[0].0 * unit, pos.y + pair[0].1 * unit);
-                    let b = Vec2::new(pos.x + pair[1].0 * unit, pos.y + pair[1].1 * unit);
+                    let a = Vec2::new(origin.x + pair[0].0 * unit, origin.y + pair[0].1 * unit);
+                    let b = Vec2::new(origin.x + pair[1].0 * unit, origin.y + pair[1].1 * unit);
                     self.batch2d.segment(a, b, color, hairline);
                 }
                 // A single-point stroke is a dot; emit a degenerate-but-finite
                 // segment so punctuation still renders.
                 if stroke.len() == 1 {
-                    let a = Vec2::new(pos.x + stroke[0].0 * unit, pos.y + stroke[0].1 * unit);
+                    let a = Vec2::new(origin.x + stroke[0].0 * unit, origin.y + stroke[0].1 * unit);
                     self.batch2d.segment(a, a, color, hairline);
                 }
             }
             pen.x += g.advance * unit;
         }
-        pen.x - pos.x
+        pen.x - origin.x
     }
 
     /// Request a tooltip for `r`.
@@ -539,19 +591,20 @@ impl<'a> Ui<'a> {
         } else {
             [(cx - d * 0.5, cy - d), (cx - d * 0.5, cy + d), (cx + d, cy)]
         };
+        let hairline = 1.5 * self.scale;
         for w in pts.windows(2) {
             self.batch2d.segment(
-                Vec2::new(w[0].0, w[0].1),
-                Vec2::new(w[1].0, w[1].1),
+                self.sv(Vec2::new(w[0].0, w[0].1)),
+                self.sv(Vec2::new(w[1].0, w[1].1)),
                 self.theme.text_dim,
-                1.5,
+                hairline,
             );
         }
         self.batch2d.segment(
-            Vec2::new(pts[2].0, pts[2].1),
-            Vec2::new(pts[0].0, pts[0].1),
+            self.sv(Vec2::new(pts[2].0, pts[2].1)),
+            self.sv(Vec2::new(pts[0].0, pts[0].1)),
             self.theme.text_dim,
-            1.5,
+            hairline,
         );
         resp.clicked
     }

@@ -293,6 +293,13 @@ pub struct LineVertex3d {
 pub struct Batch3d {
     pub solids: Vec<SolidVertex>,
     pub lines: Vec<LineVertex3d>,
+    /// Ground-plane corners for the procedural grid shader. Six `vec3`s (two
+    /// triangles) covering `min..max` on the XY plane at `z = 0`.
+    ///
+    /// The grid itself is computed per fragment from `fwidth`, so the CPU only
+    /// supplies the plane: a big quad is both cheaper and artefact-free at any
+    /// zoom, where a CPU-generated line grid would alias badly in the distance.
+    pub grid: Vec<[f32; 3]>,
 }
 
 impl Batch3d {
@@ -302,9 +309,26 @@ impl Batch3d {
     pub fn clear(&mut self) {
         self.solids.clear();
         self.lines.clear();
+        self.grid.clear();
     }
     pub fn is_empty(&self) -> bool {
-        self.solids.is_empty() && self.lines.is_empty()
+        self.solids.is_empty() && self.lines.is_empty() && self.grid.is_empty()
+    }
+
+    /// Lay a ground-plane quad at `z = 0` covering `min..max` in XY.
+    pub fn ground_plane(&mut self, min: Vec3, max: Vec3) {
+        let (mn, mx) = if (max - min).length_squared() <= 0.0 {
+            (Vec3::splat(-1000.0), Vec3::splat(1000.0))
+        } else {
+            (min, max)
+        };
+        let a = Vec3::new(mn.x, mn.y, 0.0);
+        let b = Vec3::new(mx.x, mn.y, 0.0);
+        let c = Vec3::new(mx.x, mx.y, 0.0);
+        let d = Vec3::new(mn.x, mx.y, 0.0);
+        for p in [a, b, c, a, c, d] {
+            self.grid.push(p.to_array());
+        }
     }
     /// Add a triangle with a flat normal.
     pub fn triangle(&mut self, a: Vec3, b: Vec3, c: Vec3, color: Rgba) {

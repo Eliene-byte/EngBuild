@@ -146,6 +146,12 @@ pub struct Document {
     /// Bumped on every mutation so the renderer can rebuild caches lazily.
     pub revision: u64,
     name: String,
+    /// Layer new entities land on (DXF `$CLAYER`).
+    ///
+    /// This lives on the document rather than the session because it has to
+    /// survive a save/load round trip and because the tools, which only ever see
+    /// a `&mut Document`, have to honour it. Defaults to layer 0.
+    current_layer: LayerId,
 }
 
 impl Default for Document {
@@ -161,6 +167,7 @@ impl Default for Document {
             cached_extents: None,
             revision: 1,
             name: "Drawing1.dwg".to_string(),
+            current_layer: LayerId(0),
         }
     }
 }
@@ -175,6 +182,22 @@ impl Document {
     }
     pub fn set_name(&mut self, n: impl Into<String>) {
         self.name = n.into();
+    }
+
+    /// The layer new entities are created on.
+    pub fn current_layer(&self) -> LayerId {
+        // Guard against a stale handle: a document whose layer 0 was removed, or
+        // one loaded from a file that named a layer which never arrived, must
+        // still have somewhere to draw.
+        if self.layers.by_id(self.current_layer).is_some() {
+            self.current_layer
+        } else {
+            self.layers.default_layer()
+        }
+    }
+
+    pub fn set_current_layer(&mut self, id: LayerId) {
+        self.current_layer = id;
     }
 
     /// Number of live entities.

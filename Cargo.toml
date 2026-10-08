@@ -39,6 +39,8 @@ cad-doc = { workspace = true }
 cad-gfx = { workspace = true }
 cad-ui = { workspace = true }
 cad-app = { workspace = true }
+# The status bar shows the live snap modes, so the chrome needs the enum.
+cad-snap = { workspace = true }
 winit = { workspace = true }
 
 [workspace.package]

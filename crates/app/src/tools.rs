@@ -5,7 +5,7 @@
 //! [`Tool::on_key`]. They never see wgpu or winit types, which keeps the whole
 //! editing model testable without a GPU.
 
-use cad_core::{Camera2D, Rect2, Vec2, Vec3};
+use cad_core::{Camera2D, Rect2, Vec2};
 use cad_doc::{Document, Entity, EntityId};
 use cad_geom::curve::{Arc, Circle, Line, Polyline};
 
@@ -160,6 +160,13 @@ impl ToolState {
                 ToolId::Scale => "Specify base point".into(),
                 ToolId::Mirror => "Specify first point of axis".into(),
                 ToolId::Offset => "Specify offset distance".into(),
+                ToolId::Extrude => {
+                    if points.is_empty() {
+                        "Specify base corner".into()
+                    } else {
+                        "Specify opposite corner (height follows)".into()
+                    }
+                }
                 _ => "Specify point".into(),
             }),
             ToolState::Window { .. } => Some("Specify opposite corner".into()),
@@ -357,7 +364,9 @@ impl Tool {
     }
 
     fn click_line(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
-        let layer = doc.layers.default_layer();
+        // New geometry goes on the *current* layer, not always layer 0: a
+        // layer panel that changes nothing is worse than no layer panel.
+        let layer = doc.current_layer();
         let pts = match &mut self.state {
             ToolState::Points { points, .. } => {
                 points.push(world);
@@ -391,7 +400,7 @@ impl Tool {
     }
 
     fn click_circle(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
-        let layer = doc.layers.default_layer();
+        let layer = doc.current_layer();
         let pts = match &mut self.state {
             ToolState::Points { points, .. } => {
                 points.push(world);
@@ -426,7 +435,7 @@ impl Tool {
     }
 
     fn click_arc(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
-        let layer = doc.layers.default_layer();
+        let layer = doc.current_layer();
         let pts = match &mut self.state {
             ToolState::Points { points, .. } => {
                 points.push(world);
@@ -459,7 +468,7 @@ impl Tool {
     }
 
     fn click_polyline(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
-        let layer = doc.layers.default_layer();
+        let layer = doc.current_layer();
         match &mut self.state {
             ToolState::Points { points, .. } => {
                 points.push(world);
@@ -481,7 +490,7 @@ impl Tool {
     }
 
     fn click_rectangle(&mut self, doc: &mut Document, world: Vec2) -> ToolOutcome {
-        let layer = doc.layers.default_layer();
+        let layer = doc.current_layer();
         let pts = match &mut self.state {
             ToolState::Points { points, .. } => {
                 points.push(world);
@@ -575,17 +584,23 @@ impl Tool {
         };
         if pts.len() >= 2 {
             let a = pts[0];
-            let h = pts[1].y - a.y;
-            if h.abs() > 1e-6 {
-                let layer = doc.layers.default_layer();
-                let b = cad_doc::entity::Box3d::new(
-                    Vec3::new(a.x, a.y, 0.0),
-                    Vec3::new(a.x + 10.0, a.y + 10.0, h),
+            let b2 = pts[1];
+            let size = (b2 - a).length();
+            if size > 1e-6 {
+                // A real extrude: the base corner and the opposite corner define
+                // the footprint, and the height is taken from the region's own
+                // bounding box so the result is the extruded solid rather than a
+                // fixed 10x10 placeholder.
+                let region = Polyline::new(
+                    vec![a, Vec2::new(b2.x, a.y), b2, Vec2::new(a.x, b2.y)],
+                    true,
                 );
-                let id = doc.add(Entity::solid(b).with_layer(layer));
+                let layer = doc.current_layer();
+                let mesh = cad_doc::Mesh3d::from_extrusion(&region, size);
+                let id = doc.add(Entity::new(cad_doc::EntityKind::Mesh(mesh)).with_layer(layer));
                 self.finish();
                 self.selection = vec![id];
-                return ToolOutcome::Changed(format!("Solid ({})", id.raw()));
+                return ToolOutcome::Changed(format!("Extrusion ({})", id.raw()));
             }
             self.finish();
         }
@@ -724,6 +739,7 @@ fn wrap_delta(a: f32, b: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cad_core::Vec3;
     use cad_geom::curve::Circle;
 
     fn doc_with_circle() -> (Document, EntityId) {

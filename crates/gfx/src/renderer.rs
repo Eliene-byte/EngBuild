@@ -529,6 +529,18 @@ impl Gpu {
             n
         };
 
+        // The grid is a single quad; the shader computes the lines from it.
+        let grid_verts = if solids.grid.is_empty() {
+            0
+        } else {
+            let n = self
+                .grid_buf
+                .upload(&self.device, &self.queue, &solids.grid);
+            self.stats.bytes_uploaded += n * 12;
+            draw_calls += 1;
+            n
+        };
+
         // --- record -------------------------------------------------------
         let surface_view = frame
             .texture
@@ -598,6 +610,11 @@ impl Gpu {
                 pass.set_pipeline(&self.pipelines.line_quad);
                 pass.set_vertex_buffer(0, self.line_buf.buffer.slice(..));
                 pass.draw(0..line_verts as u32, 0..1);
+            }
+            if grid_verts > 0 {
+                pass.set_pipeline(&self.pipelines.grid);
+                pass.set_vertex_buffer(0, self.grid_buf.buffer.slice(..));
+                pass.draw(0..grid_verts as u32, 0..1);
             }
             if ui_verts > 0 {
                 pass.set_pipeline(&self.pipelines.ui);

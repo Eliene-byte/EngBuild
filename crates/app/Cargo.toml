@@ -14,3 +14,7 @@ cad-doc = { workspace = true }
 cad-snap = { workspace = true }
 cad-gfx = { workspace = true }
 cad-ui = { workspace = true }
+# File I/O lives here rather than in the window crate: opening and saving a
+# drawing is a session operation, and the command line has to be able to do it
+# without going through the window.
+cad-io = { workspace = true }
