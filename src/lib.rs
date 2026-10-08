@@ -623,7 +623,7 @@ impl App {
 }
 
 /// Draw every entity: 2D curves through the tessellator, 3D solids and meshes
-/// straight into the 3D batch.
+/// into the 3D batch, and block references resolved on the fly.
 fn draw_entities(
     lines: &mut Batch2d,
     solids: &mut Batch3d,
@@ -635,8 +635,6 @@ fn draw_entities(
 ) {
     let hover = session.tool.hovered;
     let selection = &session.tool.selection;
-    let view = cam.world_viewport();
-    let tolerance = cam.world_per_pixel() * 0.25;
     let dpr = if dpr > 0.0 { dpr } else { 1.0 };
 
     for (i, e) in session.doc.entities.iter().enumerate() {
@@ -644,102 +642,252 @@ fn draw_entities(
         if !e.common.visible || !session.doc.layers.visible(e.layer()) {
             continue;
         }
-        let selected = selection.contains(&id);
-        let hovered = hover == Some(id);
-        let lc = session.doc.layers.color_of(e.layer(), theme.text);
-        let base = if selected {
-            theme.selection
-        } else {
-            e.resolved_color(lc)
-        };
-        let color = if hovered { theme.highlight } else { base };
-        let width = if hovered || selected { 2.5 } else { 1.5 };
+        draw_entity(
+            lines,
+            solids,
+            session,
+            cam,
+            canvas,
+            dpr,
+            theme,
+            e,
+            id,
+            selection.contains(&id),
+            hover == Some(id),
+            0,
+        );
+    }
+}
 
-        // 3D geometry goes to its own batch, with the real camera.
-        if e.is_3d() {
-            match &e.entity {
-                cad_doc::EntityKind::Box(b) => {
-                    solids.solid_box(b.min, b.max, color);
-                    solids.wire_box(b.min, b.max, theme.border_focused, 1.0);
-                }
-                cad_doc::EntityKind::Mesh(m) => solids.mesh(m, color),
-                cad_doc::EntityKind::Face(f) => {
-                    for p in f.loop_pts.windows(2) {
-                        solids.segment(p[0], p[1], color, 1.5);
-                    }
-                }
-                _ => {}
-            }
-            continue;
+/// How many levels of nesting a block reference is resolved to when drawn.
+const MAX_BLOCK_DEPTH: usize = 8;
+
+/// Draw one entity.
+///
+/// `depth` bounds block nesting: a block whose definition contains itself would
+/// otherwise draw forever. At the limit the reference is skipped, which loses
+/// the nesting but terminates.
+#[allow(clippy::too_many_arguments)]
+fn draw_entity(
+    lines: &mut Batch2d,
+    solids: &mut Batch3d,
+    session: &Session,
+    cam: &Camera2D,
+    canvas: Rect2,
+    dpr: f32,
+    theme: Theme,
+    e: &cad_doc::Entity,
+    _id: EntityId,
+    selected: bool,
+    hovered: bool,
+    depth: usize,
+) {
+    let lc = session.doc.layers.color_of(e.layer(), theme.text);
+    let base = if selected {
+        theme.selection
+    } else {
+        e.resolved_color(lc)
+    };
+    let color = if hovered { theme.highlight } else { base };
+    let width = if hovered || selected { 2.5 } else { 1.5 };
+
+    // A block reference is drawn by resolving it here rather than caching the
+    // explosion. The block table stays the single source of truth: editing the
+    // definition updates every instance, with no invalidation step to get wrong.
+    if let cad_doc::EntityKind::Insert(ins) = &e.entity {
+        if depth >= MAX_BLOCK_DEPTH {
+            return;
         }
+        let Some(b) = session.doc.blocks.by_id(ins.block) else {
+            return;
+        };
+        let xf = cad_geom::xform::Affine2::translation(-b.base_point.xy())
+            .then(cad_geom::xform::Affine2::scaling(cad_core::Vec2::new(
+                ins.scale.x,
+                ins.scale.y,
+            )))
+            .then(cad_geom::xform::Affine2::rotation(ins.rotation))
+            .then(cad_geom::xform::Affine2::translation(ins.position.xy()));
+        for (k, child) in b.entities.iter().enumerate() {
+            draw_entity(
+                lines,
+                solids,
+                session,
+                cam,
+                canvas,
+                dpr,
+                theme,
+                &child.transformed(&xf),
+                // Children are never individually selectable: selection belongs
+                // to the reference, so a click cannot reach inside a block.
+                EntityId(u32::MAX - depth as u32 * 1000 - k as u32),
+                false,
+                false,
+                depth + 1,
+            );
+        }
+        return;
+    }
 
-        // Points and hatches have no curve; draw them as marks.
+    if let cad_doc::EntityKind::Dimension(d) = &e.entity {
+        draw_dimension(lines, d, cam, dpr, session.doc.units.suffix(), color);
+        return;
+    }
+
+    // 3D geometry goes to its own batch, with the real camera.
+    if e.is_3d() {
         match &e.entity {
-            cad_doc::EntityKind::Point(p) => {
-                let s = cam.world_to_screen(p.position.xy()) * dpr;
-                draw_cross_mark(lines, s, 4.0 * dpr, color, dpr);
+            cad_doc::EntityKind::Box(b) => {
+                solids.solid_box(b.min, b.max, color);
+                solids.wire_box(b.min, b.max, theme.border_focused, 1.0);
             }
-            cad_doc::EntityKind::Construction(cons) => {
-                let a = cam.world_to_screen(cons.from.xy()) * dpr;
-                let b = cam.world_to_screen(cons.to.xy()) * dpr;
-                lines.dashed(a, b, color, dpr, cad_gfx::batch::Dash::new(8.0, 6.0, 0.0));
-            }
-            cad_doc::EntityKind::Text(t) => {
-                draw_text_entity(lines, cam, t, dpr, color, theme);
-            }
-            cad_doc::EntityKind::Hatch(h) => {
-                if h.solid {
-                    // A solid hatch is its boundary, filled in the boundary colour:
-                    // the UI pipeline has no polygon fill, so this is honest
-                    // rather than pretending.
-                    for l in &h.loops {
-                        let pts: Vec<Vec2> = l
-                            .vertices
-                            .iter()
-                            .map(|v| cam.world_to_screen(*v) * dpr)
-                            .collect();
-                        lines.polyline(&pts, color, dpr);
-                    }
-                } else {
-                    for l in &h.loops {
-                        let pts: Vec<Vec2> = l
-                            .vertices
-                            .iter()
-                            .map(|v| cam.world_to_screen(*v) * dpr)
-                            .collect();
-                        lines.polyline(&pts, color, dpr);
-                    }
+            cad_doc::EntityKind::Mesh(m) => solids.mesh(m, color),
+            cad_doc::EntityKind::Face(f) => {
+                for p in f.loop_pts.windows(2) {
+                    solids.segment(p[0], p[1], color, 1.5);
                 }
             }
             _ => {}
         }
-
-        let Some(curve) = e.as_curve() else { continue };
-        if !curve.bounds().overlaps(view) {
-            continue;
-        }
-        let pts = cad_geom::tessellate::tessellate(
-            &curve,
-            &cad_geom::tessellate::TessellationOptions::with_tolerance(tolerance),
-        );
-        let screen: Vec<Vec2> = pts.iter().map(|w| cam.world_to_screen(*w) * dpr).collect();
-        // Off-canvas segments still cost vertices, so clip the polyline to the
-        // canvas rect before pushing it.
-        // `Rect2` has no `Mul<f32>`, and the canvas is in CSS pixels while the
-        // screen-space points are already in device pixels, so scale the rect
-        // explicitly.
-        let clip_rect = Rect2::from_xywh(
-            canvas.min.x * dpr,
-            canvas.min.y * dpr,
-            canvas.width() * dpr,
-            canvas.height() * dpr,
-        );
-        clip_polyline(&screen, clip_rect, |a, b| {
-            lines.segment(a, b, color, width * dpr)
-        });
+        return;
     }
+
+    // Kinds with no curve, drawn as marks.
+    match &e.entity {
+        cad_doc::EntityKind::Point(p) => {
+            let s = cam.world_to_screen(p.position.xy()) * dpr;
+            draw_cross_mark(lines, s, 4.0 * dpr, color, dpr);
+        }
+        cad_doc::EntityKind::Construction(cons) => {
+            let a = cam.world_to_screen(cons.from.xy()) * dpr;
+            let b = cam.world_to_screen(cons.to.xy()) * dpr;
+            lines.dashed(a, b, color, dpr, cad_gfx::batch::Dash::new(8.0, 6.0, 0.0));
+        }
+        cad_doc::EntityKind::Text(t) => draw_text_entity(lines, cam, t, dpr, color),
+        cad_doc::EntityKind::Hatch(h) => {
+            for l in &h.loops {
+                let pts: Vec<Vec2> = l
+                    .vertices
+                    .iter()
+                    .map(|v| cam.world_to_screen(*v) * dpr)
+                    .collect();
+                lines.polyline(&pts, color, dpr);
+            }
+        }
+        _ => {}
+    }
+
+    let Some(curve) = e.as_curve() else { return };
+    let view = cam.world_viewport();
+    if !curve.bounds().overlaps(view) {
+        return;
+    }
+    let tolerance = cam.world_per_pixel() * 0.25;
+    let pts = cad_geom::tessellate::tessellate(
+        &curve,
+        &cad_geom::tessellate::TessellationOptions::with_tolerance(tolerance),
+    );
+    let screen: Vec<Vec2> = pts.iter().map(|w| cam.world_to_screen(*w) * dpr).collect();
+    // Off-canvas segments still cost vertices, so clip the polyline to the
+    // canvas rect before pushing it.
+    let clip_rect = Rect2::from_xywh(
+        canvas.min.x * dpr,
+        canvas.min.y * dpr,
+        canvas.width() * dpr,
+        canvas.height() * dpr,
+    );
+    clip_polyline(&screen, clip_rect, |a, b| {
+        lines.segment(a, b, color, width * dpr)
+    });
 }
 
+/// Draw a dimension the way a drawing reads one: extension lines, a measurement
+/// line with arrow heads at both ends, and the text above the middle.
+fn draw_dimension(
+    lines: &mut Batch2d,
+    d: &cad_doc::Dimension,
+    cam: &Camera2D,
+    dpr: f32,
+    suffix: &str,
+    color: cad_core::Rgba,
+) {
+    let s = |w: Vec2| cam.world_to_screen(w) * dpr;
+    let hair = 1.0 * dpr;
+    let (p1, p2, a, b) = d.geometry();
+    let dim = color.with_alpha(0.9);
+
+    // Extension lines, from each measured point out to just past the dimension
+    // line. AutoCAD starts them a short way off the point so the two do not
+    // touch; `extension_gap` is that offset.
+    if matches!(
+        d.kind,
+        cad_doc::DimensionKind::Linear | cad_doc::DimensionKind::Aligned
+    ) {
+        let (s1, s2) = d.readable_ends();
+        for (from, to) in [(s1, a), (s2, b)] {
+            let gap = to - from;
+            if gap.length_squared() < 1e-12 {
+                continue;
+            }
+            let u = gap.normalize();
+            let start = s(from) + u * (d.extension_gap * cam.world_to_pixels(1.0)).max(1.0);
+            lines.segment(start, s(to) + u * 2.0, dim, hair);
+        }
+    }
+
+    // The measurement line.
+    lines.segment(s(a), s(b), dim, hair);
+
+    // Arrow heads: two short barbs at each end, pointing back along the line.
+    if d.kind.has_arrows() {
+        let (da, db) = d.arrow_dirs();
+        let size = (d.arrow * cam.world_to_pixels(1.0)).max(3.0);
+        for (tip, dir) in [(a, da), (b, db)] {
+            let tip = s(tip);
+            let back = tip + cam.world_to_screen(dir).normalize_or(cad_core::Vec2::X) * -size;
+            let n = cad_core::Vec2::new(-dir.y, dir.x) * size * 0.28;
+            // Two barbs rather than a filled triangle: at a hairline stroke a
+            // filled head disappears, and the barbs read the same at any zoom.
+            lines.segment(back, tip - n, dim, hair);
+            lines.segment(back, tip + n, dim, hair);
+        }
+    }
+
+    // The text, centred on its position and drawn in screen space so its size
+    // does not change with the zoom -- a dimension's text is read, not measured.
+    let label = d.text(suffix);
+    if label.is_empty() {
+        return;
+    }
+    let at = s(d.text_position());
+    let unit = d.height * cam.world_to_pixels(1.0);
+    let size = (unit * dpr).clamp(7.0 * dpr, 26.0 * dpr);
+    let w = cad_ui::text_width(&label, size / dpr);
+    let y = at.y - size * 0.9;
+    stroke_text(lines, &label, Vec2::new(at.x - w * 0.5, y), size, dim);
+}
+
+/// Stroke `s` at a fixed pixel size, whatever the zoom.
+fn stroke_text(lines: &mut Batch2d, s: &str, pos: Vec2, size: f32, color: cad_core::Rgba) {
+    let unit = size / cad_ui::font::UNITS_H;
+    let hairline = (size * 0.09).max(1.0);
+    for c in s.chars() {
+        let g = cad_ui::font::glyph(c);
+        for stroke in g.strokes {
+            for pair in stroke.windows(2) {
+                let a = Vec2::new(pos.x + pair[0].0 * unit, pos.y + pair[0].1 * unit);
+                let b = Vec2::new(pos.x + pair[1].0 * unit, pos.y + pair[1].1 * unit);
+                lines.segment(a, b, color, hairline);
+            }
+            // A single-point stroke is a dot; a degenerate-but-finite segment
+            // renders it.
+            if stroke.len() == 1 {
+                let a = Vec2::new(pos.x + stroke[0].0 * unit, pos.y + stroke[0].1 * unit);
+                lines.segment(a, a, color, hairline);
+            }
+        }
+    }
+}
 /// Sutherland-Hodgman clip of a polyline to `rect`, emitting each kept run.
 ///
 /// A drawing can extend far outside the viewport; uploading every tessellated
@@ -825,7 +973,6 @@ fn draw_text_entity(
     t: &cad_doc::Text,
     dpr: f32,
     color: cad_core::Rgba,
-    _theme: Theme,
 ) {
     // Glyph strokes are in font units; project the unit box through the camera so
     // the text tracks zoom and rotation exactly like any other geometry.

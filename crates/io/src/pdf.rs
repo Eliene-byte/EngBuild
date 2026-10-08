@@ -183,7 +183,9 @@ impl Frame {
     /// so on, and that is a decision the user makes, not the fitter.
     pub fn as_drawing_scale(&self) -> f32 {
         let mm_per_unit = self.scale / mm_to_pt(1.0);
-        if !(mm_per_unit > 0.0) {
+        // `is_finite` first: NaN fails every comparison, and a plot scale that
+        // has become NaN must not reach a title block.
+        if !mm_per_unit.is_finite() || mm_per_unit <= 0.0 {
             return 1.0;
         }
         let n = 1.0 / mm_per_unit;
@@ -356,7 +358,7 @@ pub fn render(doc: &Document, opts: &PlotOptions) -> Result<Vec<u8>, PlotError> 
     }
 
     if opts.border {
-        content.push_str(&draw_frame(&opts, pw, ph, frame.as_drawing_scale()));
+        content.push_str(&draw_frame(opts, pw, ph, frame.as_drawing_scale()));
     }
 
     // --- assemble ----------------------------------------------------------
@@ -604,10 +606,10 @@ pub fn collect_paths(doc: &Document, tol: f32) -> (Vec<(Vec<Vec2>, Rgba)>, Vec<S
                 None
             }
         };
-        if let Some(pts) = pts {
-            if pts.len() >= 2 {
-                out.push((pts, color));
-            }
+        if let Some(pts) = pts
+            && pts.len() >= 2
+        {
+            out.push((pts, color));
         }
     }
     skipped.sort();
@@ -880,15 +882,15 @@ mod tests {
             .skip(3)
             .skip_while(|l| l.contains("65535 f"));
         let mut n = 1;
-        loop {
-            let Some(row) = rows.next() else { break };
-            let Some(off) = row.split_whitespace().next() else {
+        while let Some(row) = rows.next() {
+            // The first row that does not start with a ten-digit offset is the
+            // trailer, and `parse` failing is how that is detected.
+            let Some(off) = row
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())
+            else {
                 break;
-            };
-            let off: usize = match off.parse() {
-                Ok(v) => v,
-                // The trailer starts here.
-                Err(_) => break,
             };
             assert!(
                 bytes[off..].starts_with(format!("{n} 0 obj").as_bytes()),

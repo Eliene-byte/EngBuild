@@ -713,14 +713,14 @@ impl Session {
 
         // Only a command that actually ran becomes context. Logging a typo would
         // teach the model that the user runs commands that do not exist.
-        let result = self.run_command_line_inner(&name, arg);
+        let result = self.run_command_line_inner(&name, arg, &extra);
         if result.is_ok() {
             self.log_command(&name);
         }
         result
     }
 
-    fn run_command_line_inner(&mut self, name: &str, arg: &str) -> CommandResult {
+    fn run_command_line_inner(&mut self, name: &str, arg: &str, extra: &[&str]) -> CommandResult {
         match name {
             "open" | "o" => {
                 if arg.is_empty() {
@@ -805,6 +805,88 @@ impl Session {
                 self.select_all();
                 CommandResult::Ok
             }
+            "array" => {
+                // `array rows cols [dx dy] [angle]`. The counts default to 2x2 and
+                // the spacing to the selection's own size, so a bare `array`
+                // does something visible instead of complaining.
+                let (rows, cols) = match (arg, extra.first()) {
+                    ("", _) => (2, 2),
+                    (a, None) => match a.parse::<u32>() {
+                        Ok(n) => (n, n),
+                        Err(_) => {
+                            self.status = StatusMessage::error("ARRAY needs row and column counts");
+                            return CommandResult::Error("bad array".into());
+                        }
+                    },
+                    (a, Some(b)) => match (a.parse::<u32>(), b.parse::<u32>()) {
+                        (Ok(r), Ok(c)) => (r, c),
+                        _ => {
+                            self.status =
+                                StatusMessage::error("ARRAY counts must be whole numbers");
+                            return CommandResult::Error("bad array".into());
+                        }
+                    },
+                };
+                let span = self.selection_span();
+                let polar = extra
+                    .get(1)
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .map(|d| d.to_radians());
+                let spacing =
+                    Vec2::new(span.x * (cols.max(2) as f32), span.y * (rows.max(2) as f32));
+                self.array_selection(rows, cols, spacing, polar)
+            }
+            "block" | "b" => {
+                if arg.is_empty() {
+                    self.status = StatusMessage::prompt("Type BLOCK <name>");
+                    return CommandResult::Unavailable;
+                }
+                self.make_block(arg)
+            }
+            "insert" | "i" => {
+                if arg.is_empty() {
+                    self.status = StatusMessage::prompt("Type INSERT <block>");
+                    return CommandResult::Unavailable;
+                }
+                let Some(id) = self.doc.blocks.by_name(&arg.to_ascii_uppercase()) else {
+                    self.status = StatusMessage::error(format!("No block named {arg}"));
+                    return CommandResult::Error(format!("no block {arg}"));
+                };
+                // Without a point on the command line, insert at the selection's
+                // centre if there is one and at the origin otherwise.
+                let at = self.selection_span_centre();
+                self.insert_block(id, at, 0.0, 1.0)
+            }
+            "explode" | "x" => self.explode_selection(),
+            "dimlinear" | "dimlin" | "dimaligned" | "dimali" | "dimradius" | "dimrad"
+            | "dimdiameter" | "dimdia" | "dimangular" | "dimang" => {
+                // Every dimension kind shares the same two-point sequence; only
+                // what the number means differs.
+                let Some(kind) = cad_doc::DimensionKind::from_command(name) else {
+                    return CommandResult::Error(format!("unknown dimension {name}"));
+                };
+                if self.tool.selection.len() < 2 {
+                    self.status = StatusMessage::error(format!(
+                        "{} needs two points",
+                        kind.command().to_ascii_uppercase()
+                    ));
+                    return CommandResult::Unavailable;
+                }
+                // Two entities, each contributing one measurement point.
+                let pts: Vec<cad_core::Vec2> = self
+                    .tool
+                    .selection
+                    .iter()
+                    .take(2)
+                    .filter_map(|id| self.doc.entities.get(*id))
+                    .map(|e| e.bounds_2d().center())
+                    .collect();
+                if pts.len() < 2 {
+                    self.status = StatusMessage::error("Select two objects");
+                    return CommandResult::Unavailable;
+                }
+                self.add_dimension(kind, pts[0], pts[1], self.selection_span_centre())
+            }
             "erase" | "e" | "del" | "delete" => self.delete_selection(),
             "help" | "?" | "??" => {
                 self.status = StatusMessage::info(format!(
@@ -845,6 +927,264 @@ impl Session {
         self.viewport.refresh_target();
         self.path = None;
         self.status = StatusMessage::success("New drawing");
+    }
+
+    // ------------------------------------------------------- array and blocks
+
+    /// Array the selection: `rows` x `cols` copies, or `count` copies on a
+    /// circle when `polar` is set.
+    ///
+    /// The original is replaced by the whole array, which is AutoCAD's behaviour
+    /// and the reason an array is a single undo step rather than `n-1` of them.
+    pub fn array_selection(
+        &mut self,
+        rows: u32,
+        cols: u32,
+        spacing: Vec2,
+        polar: Option<f32>,
+    ) -> CommandResult {
+        if self.tool.selection.is_empty() {
+            self.status = StatusMessage::error("Select objects, then Array");
+            return CommandResult::Unavailable;
+        }
+        let (rows, cols) = (rows.max(1), cols.max(1));
+        let total = if let Some(_angle) = polar {
+            rows.max(cols)
+        } else {
+            rows.saturating_mul(cols)
+        };
+        if total <= 1 {
+            self.status = StatusMessage::error("An array needs more than one copy");
+            return CommandResult::Unavailable;
+        }
+        // Refuse a grid that would run off the end of a float. A user typing
+        // `array 1000 1000` should get a message, not a hang or a NaN.
+        if (rows as u64) * (cols as u64) > 100_000 {
+            self.status =
+                StatusMessage::error(format!("That would create {total} copies; pick fewer"));
+            return CommandResult::Error("array too large".into());
+        }
+
+        let originals: Vec<(cad_doc::EntityId, cad_doc::Entity)> = self
+            .tool
+            .selection
+            .iter()
+            .filter_map(|id| self.doc.entities.get(*id).map(|e| (*id, e.clone())))
+            .collect();
+        if originals.is_empty() {
+            return CommandResult::Unavailable;
+        }
+        let total = total as usize;
+        let mut made = Vec::with_capacity(originals.len() * total);
+        let mut history = std::mem::take(&mut self.history);
+        {
+            let mut tx = history.begin(&mut self.doc.entities, &format!("Array ({total} copies)"));
+            for id in originals.iter().map(|(id, _)| *id) {
+                tx.remove(id);
+            }
+            for (_, src) in originals.iter() {
+                for copy in 0..total {
+                    let placed = match polar {
+                        Some(total_angle) => {
+                            let step = total_angle / total as f32;
+                            let about = array_centre(&originals);
+                            src.rotated(about, step * copy as f32)
+                        }
+                        None => {
+                            let (dx, dy) = array_offset(copy as u32, rows, cols, spacing);
+                            src.translated(Vec3::new(dx, dy, 0.0))
+                        }
+                    };
+                    // Copy 0 lands on the original's own slot, so the array
+                    // starts where the user drew it.
+                    made.push(tx.insert(placed));
+                }
+            }
+            tx.commit();
+        }
+        self.history = history;
+        self.doc.invalidate_extents();
+        self.tool.selection = made;
+        self.dirty = true;
+        self.status = StatusMessage::success(format!("Arrayed {} copies", total));
+        CommandResult::Ok
+    }
+
+    /// The selection's own size, for array spacing defaults.
+    pub fn selection_span(&self) -> Vec2 {
+        let mut r = Rect2::EMPTY;
+        let mut any = false;
+        for id in &self.tool.selection {
+            if let Some(e) = self.doc.entities.get(*id) {
+                let b = e.bounds_2d();
+                r = if any { r.union(b) } else { b };
+                any = true;
+            }
+        }
+        if any { r.size() } else { Vec2::splat(10.0) }
+    }
+
+    /// Where an insert lands with no point on the command line.
+    pub fn selection_span_centre(&self) -> Vec2 {
+        let mut r = Rect2::EMPTY;
+        let mut any = false;
+        for id in &self.tool.selection {
+            if let Some(e) = self.doc.entities.get(*id) {
+                let b = e.bounds_2d();
+                r = if any { r.union(b) } else { b };
+                any = true;
+            }
+        }
+        if any { r.center() } else { Vec2::ZERO }
+    }
+
+    /// Add an associative dimension between two points, with `text` placed at
+    /// `at`.
+    pub fn add_dimension(
+        &mut self,
+        kind: cad_doc::DimensionKind,
+        p1: Vec2,
+        p2: Vec2,
+        at: Vec2,
+    ) -> CommandResult {
+        let suffix = self.doc.units.suffix().to_string();
+        let layer = self.doc.current_layer();
+        let d = cad_doc::Dimension::new(kind, p1, p2, at);
+        let text = d.text(&suffix);
+        // A dimension whose measured value rounds to zero is a mistake, not a
+        // measurement, and drawing it hides the mistake.
+        if kind != cad_doc::DimensionKind::Angular && d.measurement() <= 1e-6 {
+            self.status = StatusMessage::error("Those points coincide");
+            return CommandResult::Error("zero-length dimension".into());
+        }
+        let id = self
+            .doc
+            .add(cad_doc::Entity::new(cad_doc::EntityKind::Dimension(d)).with_layer(layer));
+        self.tool.selection = vec![id];
+        self.doc.invalidate_extents();
+        self.dirty = true;
+        self.status = StatusMessage::success(format!("Dimension {text}"));
+        CommandResult::Ok
+    }
+
+    /// Turn the selection into a block definition named `name`.
+    pub fn make_block(&mut self, name: &str) -> CommandResult {
+        if self.tool.selection.is_empty() {
+            self.status = StatusMessage::error("Select objects, then Block");
+            return CommandResult::Unavailable;
+        }
+        let mut name = name.trim().to_ascii_uppercase();
+        if name.is_empty() {
+            name = "BLOCK1".to_string();
+        }
+        // The base point is the selection's own lower-left corner, which is what
+        // makes the insert land predictably without asking for a point first.
+        let mut base = Rect2::ZERO;
+        let mut first = true;
+        for id in &self.tool.selection {
+            if let Some(e) = self.doc.entities.get(*id) {
+                let b = e.bounds_2d();
+                base = if first { b } else { base.union(b) };
+                first = false;
+            }
+        }
+        if first {
+            self.status = StatusMessage::error("Select objects, then Block");
+            return CommandResult::Unavailable;
+        }
+        let origin = base.min;
+        let entities: Vec<cad_doc::Entity> = self
+            .tool
+            .selection
+            .iter()
+            .filter_map(|id| self.doc.entities.get(*id).cloned())
+            .map(|e| e.translated(Vec3::new(-origin.x, -origin.y, 0.0)))
+            .collect();
+        let n = entities.len();
+        let mut block = cad_doc::Block::new(&name);
+        block.base_point = Vec3::new(origin.x, origin.y, 0.0);
+        block.entities = entities;
+        let id = self.doc.blocks.insert(block);
+        // Keep the original on screen: AutoCAD leaves it and reports the block.
+        self.status = StatusMessage::success(format!(
+            "Block {} created from {n} entities",
+            self.doc.blocks.name(id)
+        ));
+        self.dirty = true;
+        CommandResult::Ok
+    }
+
+    /// Place `block` at `pos`, `rotation` radians, scaled by `factor`.
+    pub fn insert_block(
+        &mut self,
+        block: cad_doc::BlockId,
+        pos: Vec2,
+        rotation: f32,
+        factor: f32,
+    ) -> CommandResult {
+        let Some(b) = self.doc.blocks.by_id(block) else {
+            self.status = StatusMessage::error("No such block");
+            return CommandResult::Unavailable;
+        };
+        if b.is_empty() {
+            self.status =
+                StatusMessage::error(format!("Block {} is empty", self.doc.blocks.name(block)));
+            return CommandResult::Unavailable;
+        }
+        let name = self.doc.blocks.name(block).to_string();
+        let ins = cad_doc::entity::InsertRef {
+            block,
+            position: Vec3::new(pos.x, pos.y, 0.0),
+            scale: Vec3::splat(factor.abs().max(1e-6)),
+            rotation,
+            rows: 1,
+            columns: 1,
+            row_spacing: 0.0,
+            col_spacing: 0.0,
+        };
+        let layer = self.doc.current_layer();
+        let id = self.doc.add(cad_doc::Entity::insert(ins).with_layer(layer));
+        self.tool.selection = vec![id];
+        self.dirty = true;
+        self.status = StatusMessage::success(format!("Inserted {name}"));
+        CommandResult::Ok
+    }
+
+    /// Replace the selection with real geometry from its blocks.
+    ///
+    /// Explode is the escape hatch from a block that cannot be edited, so it has
+    /// to be lossless in what it keeps: every entity becomes real geometry and
+    /// nothing is left behind.
+    pub fn explode_selection(&mut self) -> CommandResult {
+        let inserts: Vec<(cad_doc::EntityId, cad_doc::Entity)> = self
+            .tool
+            .selection
+            .iter()
+            .filter_map(|id| self.doc.entities.get(*id).map(|e| (*id, e.clone())))
+            .filter(|(_, e)| matches!(e.entity, cad_doc::EntityKind::Insert(_)))
+            .collect();
+        if inserts.is_empty() {
+            self.status = StatusMessage::error("Select a block reference to explode");
+            return CommandResult::Unavailable;
+        }
+        let mut made = Vec::new();
+        let mut history = std::mem::take(&mut self.history);
+        {
+            let mut tx = history.begin(&mut self.doc.entities, "Explode");
+            for (id, e) in &inserts {
+                tx.remove(*id);
+                for child in explode_entity(&self.doc.blocks, e, 0) {
+                    made.push(tx.insert(child.with_layer(e.layer())));
+                }
+            }
+            tx.commit();
+        }
+        self.history = history;
+        self.doc.invalidate_extents();
+        self.tool.selection = made.clone();
+        self.dirty = true;
+        self.status = StatusMessage::success(format!("Exploded into {} entities", made.len()));
+        CommandResult::Ok
     }
 
     // ---------------------------------------------------------------- layers
@@ -898,6 +1238,78 @@ impl Session {
         self.dirty = true;
         self.status = StatusMessage::info(format!("Current layer: {}", self.doc.layers.name(id)));
     }
+}
+
+/// Where the `copy`-th member of a rectangular array goes.
+fn array_offset(copy: u32, _rows: u32, cols: u32, spacing: Vec2) -> (f32, f32) {
+    let r = copy / cols.max(1);
+    let c = copy % cols.max(1);
+    (c as f32 * spacing.x, r as f32 * spacing.y)
+}
+
+/// Extents of a set of captured entities, for reporting an array's span.
+fn originals_bounds(originals: &[(cad_doc::EntityId, cad_doc::Entity)]) -> Rect2 {
+    let mut r = Rect2::EMPTY;
+    for (_, e) in originals {
+        r = r.expand_point(e.bounds_2d().min);
+        r = r.expand_point(e.bounds_2d().max);
+    }
+    r
+}
+
+/// The centre a polar array rotates about: the selection's own centre, which
+/// is what makes a polar array read as a rotation rather than a scatter.
+fn array_centre(originals: &[(cad_doc::EntityId, cad_doc::Entity)]) -> Vec3 {
+    let b = originals_bounds(originals);
+    if b.is_empty() {
+        Vec3::ZERO
+    } else {
+        let c = b.center();
+        Vec3::new(c.x, c.y, 0.0)
+    }
+}
+
+/// Expand one INSERT into real geometry, bounded by `depth`.
+///
+/// A block that contains itself would otherwise expand forever, so the depth
+/// limit *is* the cycle guard: at the limit the reference is kept rather than
+/// resolved, which loses the nesting but terminates.
+fn explode_entity(
+    blocks: &cad_doc::BlockTable,
+    e: &cad_doc::Entity,
+    depth: usize,
+) -> Vec<cad_doc::Entity> {
+    /// How many levels of nesting an explode will follow.
+    const MAX_DEPTH: usize = 8;
+    let cad_doc::EntityKind::Insert(ins) = &e.entity else {
+        return vec![e.clone()];
+    };
+    if depth >= MAX_DEPTH {
+        return vec![e.clone()];
+    }
+    let Some(b) = blocks.by_id(ins.block) else {
+        // A dangling reference has no geometry to become. Dropping it is the
+        // only honest option, and the caller reports the count.
+        return Vec::new();
+    };
+    // Block definition space -> world: undo the base point, scale, rotate, place.
+    let xf = cad_geom::xform::Affine2::translation(-b.base_point.xy())
+        .then(cad_geom::xform::Affine2::scaling(cad_core::Vec2::new(
+            ins.scale.x,
+            ins.scale.y,
+        )))
+        .then(cad_geom::xform::Affine2::rotation(ins.rotation))
+        .then(cad_geom::xform::Affine2::translation(ins.position.xy()));
+    let mut out = Vec::with_capacity(b.entities.len());
+    for child in &b.entities {
+        let placed = child.transformed(&xf);
+        if placed.is_3d() {
+            out.push(placed);
+        } else {
+            out.extend(explode_entity(blocks, &placed, depth + 1));
+        }
+    }
+    out
 }
 
 /// File name for a status message: the last path component, so the message stays

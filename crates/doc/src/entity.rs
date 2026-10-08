@@ -1031,6 +1031,170 @@ impl Entity {
         out
     }
 
+    /// Apply a 2D affine transform to any entity that has geometry.
+    ///
+    /// Z is carried through unchanged: a block reference inserted into a plan
+    /// drawing keeps its elevation, and a pure 2D transform must not silently
+    /// move solids off the ground plane.
+    pub fn transformed(&self, t: &cad_geom::xform::Affine2) -> Entity {
+        let mut out = self.clone();
+        let p2 = |p: Vec2| t.apply(p);
+        let p3 = |p: Vec3| {
+            let q = t.apply(p.xy());
+            Vec3::new(q.x, q.y, p.z)
+        };
+        // A non-uniform scale turns a circle into an ellipse and an arc into a
+        // Bézier, so anything that is not a similarity has to be promoted. This
+        // is the same rule `Curve::transformed` already applies; asking it is
+        // cheaper and safer than repeating the test per kind.
+        let similarity = t.is_similarity();
+        let mirroring = t.is_mirroring();
+
+        macro_rules! curve_or_poly {
+            ($k:expr) => {{
+                let c: cad_geom::Curve = $k;
+                if similarity {
+                    c.transformed(t)
+                } else {
+                    // Under a non-uniform scale a circle is not a circle, so the
+                    // curve is flattened rather than kept with a shape it no
+                    // longer has.
+                    cad_geom::Curve::Polyline(as_polyline(&c))
+                }
+            }};
+        }
+
+        match &mut out.entity {
+            EntityKind::Line(l) => {
+                l.p0 = p2(l.p0);
+                l.p1 = p2(l.p1);
+            }
+            EntityKind::Circle(c) => {
+                out.entity = match curve_or_poly!(cad_geom::Curve::Circle(*c)) {
+                    cad_geom::Curve::Circle(g) => EntityKind::Circle(g),
+                    other => EntityKind::Polyline(as_polyline(&other)),
+                }
+            }
+            EntityKind::Arc(a) => {
+                out.entity = match curve_or_poly!(cad_geom::Curve::Arc(*a)) {
+                    cad_geom::Curve::Arc(g) => EntityKind::Arc(g),
+                    other => EntityKind::Polyline(as_polyline(&other)),
+                }
+            }
+            EntityKind::Ellipse(e) => {
+                out.entity = match curve_or_poly!(cad_geom::Curve::Ellipse(*e)) {
+                    cad_geom::Curve::Ellipse(g) => EntityKind::Ellipse(g),
+                    other => EntityKind::Polyline(as_polyline(&other)),
+                }
+            }
+            EntityKind::Polyline(p) | EntityKind::Region(p) => {
+                for q in &mut p.vertices {
+                    *q = p2(*q);
+                }
+                // An anisotropic scale turns an arc into a Bézier, which this
+                // representation cannot store: flatten it instead of keeping a
+                // bulge that no longer describes the shape.
+                if !similarity {
+                    p.bulges
+                        .iter_mut()
+                        .for_each(|b| *b = cad_geom::bulge::Bulge::NONE);
+                }
+            }
+            EntityKind::Spline(s) => {
+                for seg in &mut s.segments {
+                    for q in seg.p.iter_mut() {
+                        *q = p2(*q);
+                    }
+                }
+                for q in &mut s.control_points {
+                    *q = p2(*q);
+                }
+            }
+            EntityKind::Point(p) => p.position = p3(p.position),
+            EntityKind::Text(tx) => {
+                tx.insert = p3(tx.insert);
+                // The image of the text's own axis is the new rotation, and a
+                // mirroring reverses the reading direction.
+                let axis = t.apply_dir(Vec2::X);
+                tx.rotation = axis.y.atan2(axis.x);
+                tx.width_factor *= t.axis_x().length();
+                if mirroring {
+                    tx.rotation = -tx.rotation;
+                }
+            }
+            EntityKind::Hatch(h) => {
+                for l in &mut h.loops {
+                    for q in &mut l.vertices {
+                        *q = p2(*q);
+                    }
+                }
+                h.pattern_angle += t.rotation_angle();
+                h.pattern_scale *= t.scale_factor();
+            }
+            EntityKind::Dimension(d) => {
+                d.p1 = p2(d.p1);
+                d.p2 = p2(d.p2);
+                d.line = p2(d.line);
+                if let Some(a) = d.text_at.as_mut() {
+                    *a = p2(*a);
+                }
+                d.height *= t.scale_factor();
+                d.arrow *= t.scale_factor();
+                if let Some(over) = d.text_override.as_mut() {
+                    // The stored number is now wrong; drop the override so the
+                    // dimension goes back to measuring.
+                    *over = over.clone();
+                    d.text_override = None;
+                }
+            }
+            EntityKind::Box(b) => {
+                // Take the four corners, transform them, and rebuild the box as
+                // the bounds of what came out. A rotated box is not axis-aligned,
+                // and pretending otherwise would shear it.
+                let corners = b.bounds().corners();
+                let mut r = cad_core::Rect2::EMPTY;
+                for c in corners {
+                    let q = p2(c.xy());
+                    r = r.expand_point(q);
+                }
+                b.min = Vec3::new(r.min.x, r.min.y, b.min.z);
+                b.max = Vec3::new(r.max.x, r.max.y, b.max.z);
+            }
+            EntityKind::Construction(c) => {
+                c.from = p3(c.from);
+                c.to = p3(c.to);
+            }
+            EntityKind::Insert(i) => {
+                i.position = p3(i.position);
+                i.rotation += t.rotation_angle();
+                if mirroring {
+                    i.scale.y = -i.scale.y;
+                }
+                i.scale.x *= t.axis_x().length();
+                i.scale.y *= t.axis_y().length();
+            }
+            EntityKind::Face(f) => {
+                for q in &mut f.loop_pts {
+                    *q = p3(*q);
+                }
+                // A 2D transform leaves the plane's normal only valid if it was
+                // vertical; recompute from the transformed loop otherwise.
+                if let Some(first) = f.loop_pts.first() {
+                    let n = f.plane.n;
+                    f.plane = Plane3::new(n, n.dot(*first));
+                }
+            }
+            EntityKind::Mesh(m) => {
+                for q in &mut m.positions {
+                    *q = p3(*q);
+                }
+                m.recompute_normals();
+            }
+            EntityKind::Unknown { .. } => {}
+        }
+        out
+    }
+
     /// The effective colour given the entity's own override and its layer.
     pub fn resolved_color(&self, layer_color: Rgba) -> Rgba {
         match self.common.color {
