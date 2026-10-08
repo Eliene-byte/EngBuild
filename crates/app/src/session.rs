@@ -372,14 +372,38 @@ impl Session {
     /// is closer than an unsolved one, and the status bar says how far off it
     /// is rather than pretending it worked.
     pub fn constrain(&mut self, kind: ConstraintKind, value: Option<f32>) -> CommandResult {
-        // Fix pins whatever is selected, so it needs one object, not two. Every
-        // other kind relates two objects to each other.
+        // Fix pins whatever is selected, so it takes its own path: one object,
+        // every anchor, no pairs.
         if kind == ConstraintKind::Fix {
             if self.tool.selection.is_empty() {
                 self.status = StatusMessage::error("Select objects to fix");
                 return CommandResult::Unavailable;
             }
-        } else if self.tool.selection.len() < 2 {
+            let mut problem = self.constraints.clone();
+            let mut points = Vec::new();
+            let mut ids = Vec::new();
+            for id in self.tool.selection.clone() {
+                let Some(e) = self.doc.entities.get(id) else {
+                    continue;
+                };
+                let anchors = e.anchor_points();
+                if anchors.is_empty() {
+                    continue;
+                }
+                let base = points.len();
+                points.extend_from_slice(&anchors);
+                for k in 0..anchors.len() {
+                    problem.add(cad_geom::constraint::Constraint::Fix { point: base + k });
+                }
+                ids.push(id);
+            }
+            if ids.is_empty() {
+                self.status = StatusMessage::error("Those objects have no points to constrain");
+                return CommandResult::Unavailable;
+            }
+            return self.apply_constraints(problem, points, vec![ids]);
+        }
+        if self.tool.selection.len() < 2 {
             self.status = StatusMessage::error("Select two objects to constrain");
             return CommandResult::Unavailable;
         }
@@ -435,19 +459,10 @@ impl Session {
                 }
             }
             ConstraintKind::Fix => {
-                // Fix pins every anchor of the selection, not just two points.
-                let mut problem = self.constraints.clone();
-                for id in &self.tool.selection {
-                    if let Some(e) = self.doc.entities.get(*id) {
-                        let base = points.len();
-                        let anchors = e.anchor_points();
-                        points.extend_from_slice(&anchors);
-                        for k in 0..anchors.len() {
-                            problem.add(cad_geom::constraint::Constraint::Fix { point: base + k });
-                        }
-                    }
-                }
-                return self.apply_constraints(problem, points, vec![ids.clone()]);
+                // Handled on its own path above; reaching here would mean the
+                // early return was removed.
+                debug_assert!(false, "fix takes the early path");
+                return CommandResult::Unavailable;
             }
         };
         problem.add(constraint);
