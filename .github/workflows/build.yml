@@ -80,35 +80,39 @@ jobs:
             > clippy.log 2>&1 || status=$?
           cat clippy.log
           if [ "$status" -ne 0 ]; then
-            # Re-emit each diagnostic as a workflow command so it becomes a real
-            # check annotation; without this a clippy failure is invisible
-            # outside the log viewer.
-            while IFS= read -r line; do
-              file=$(printf '%s' "$line" | cut -d: -f1)
-              ln=$(printf '%s' "$line" | cut -d: -f2)
-              msg=$(printf '%s' "$line" | cut -d: -f5-)
-              echo "::error file=$file,line=$ln,title=clippy::$msg"
-            done <<< "$(grep -E '^[^ ]+\.rs:[0-9]+:[0-9]+: error' clippy.log | head -50)"
-            # A failure with no parseable diagnostic means cargo itself gave up
-            # (bad manifest, unresolvable lockfile). Say so explicitly rather
-            # than reporting a bare exit code.
-            if ! grep -qE '^[^ ]+\.rs:[0-9]+:[0-9]+: error' clippy.log; then
-              echo "::error title=clippy::clippy failed with no Rust diagnostic; cargo itself could not complete."
-              # One annotation per log line: a cargo-level failure (manifest,
-              # lockfile, rustup component, disk) otherwise shows up here as a
-              # bare exit code with nothing to go on.
-              # Take the tail: the interesting part is the end. The start is
-              # hundreds of "Downloading"/"Checking" lines that tell us nothing.
-              # Uploaded logs are only downloadable with a token, so the log has to
-              # travel through annotations to be readable at all. Strip the
-              # control characters cargo emits so each one is a single line.
-              n=0
-              while IFS= read -r line && [ "$n" -lt 60 ]; do
-                clean=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037')
-                echo "::error title=clippy-log::$clean"
-                n=$((n + 1))
-              done < <(tail -n 60 clippy.log)
-            fi
+            echo "::error title=test-summary::tests failed; the failing cases follow."
+
+            # GitHub deduplicates annotations by message, so emitting one
+            # annotation per test name and another per panic line collapses every
+            # failure into one unreadable entry. Emit a single annotation per
+            # failing test, carrying its own panic message.
+            #
+            # `cargo test` prints `---- name stdout ----` first and the panic
+            # after it, so awk holds the name until it sees the panic.
+            awk '
+              function flush() {
+                if (pending != "" && msg != "") {
+                  printf "::error title=%s::%s\n", pending, msg
+                }
+                pending = ""
+                msg = ""
+              }
+              /^---- / {
+                flush()
+                split($0, parts, " ")
+                pending = parts[2]
+                next
+              }
+              /^thread .* panicked at / {
+                sub(/^thread .* panicked at /, "")
+                msg = $0
+                next
+              }
+              msg != "" && $0 !~ /^note:|^note |^$|^stack backtrace/ {
+                msg = msg " | " $0
+              }
+              END { flush() }
+            ' test.log
           fi
           exit "$status"
 
