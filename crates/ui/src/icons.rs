@@ -55,18 +55,25 @@ pub fn decode(icon: Icon) -> Vec<Polyline> {
         }
         let n = (bytes.len() / 2).min(POINTS);
         let mut p = [(0.0f32, 0.0f32); POINTS];
+        let mut ok = true;
         for i in 0..n {
             match (
                 (bytes[i * 2] as char).to_digit(16),
                 (bytes[i * 2 + 1] as char).to_digit(16),
             ) {
                 (Some(x), Some(y)) => p[i] = (x as f32, y as f32),
-                // A single bad nibble poisons the stroke; dropping the whole
-                // stroke is better than drawing half of it.
-                _ => break,
+                // One bad nibble poisons the whole stroke, and skipping it is
+                // the point: a half-drawn icon reads as a bug in the glyph,
+                // while a missing one reads as a missing icon.
+                _ => {
+                    ok = false;
+                    break;
+                }
             }
         }
-        out.push(p);
+        if ok {
+            out.push(p);
+        }
     }
     out
 }
@@ -396,7 +403,9 @@ mod tests {
     fn malformed_data_decodes_to_nothing_rather_than_panicking() {
         // "08" is a single point, so it is *not* malformed: a polyline of one
         // point is a dot, which is how every `select`-style icon ends.
-        for bad in ["", "0", "0G", "08G4", "88,88,8", "0", "0F0G", ","] {
+        // A stroke of one point *is* legal (a dot), so "08" is not here; what
+        // is here is anything that cannot be read as whole two-nibble points.
+        for bad in ["", "0", "0G", "08G4", "88,88,8", "0F0G", ","] {
             assert_eq!(
                 decode(Icon {
                     name: "bad",
