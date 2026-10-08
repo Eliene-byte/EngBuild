@@ -171,19 +171,19 @@ impl Layout {
         let w = ((total - gap * (n as f32 - 1.0)) / n as f32).max(0.0);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            let x = match align {
-                Align::Start => self.area.min.x + self.padding.left + i as f32 * (w + gap),
-                Align::Center => {
-                    let used = n as f32 * w + (n as f32 - 1.0) * gap;
-                    let x0 = self.area.min.x + self.padding.left + (total - used) * 0.5;
-                    x0 + i as f32 * (w + gap)
-                }
-                Align::End => {
-                    let used = n as f32 * w + (n as f32 - 1.0) * gap;
-                    let x0 = self.area.min.x + self.padding.left + (total - used);
-                    x0 + i as f32 * (w + gap)
-                }
+            // `used` is `total` by construction, so there is never any slack for
+            // `align` to distribute and every branch computes the same `x`. The
+            // parameter is kept because callers pass it, and because equal
+            // auto-fill is what a ribbon row wants; treat it as documentation of
+            // intent rather than as a live offset.
+            let used = n as f32 * w + (n as f32 - 1.0) * gap;
+            let slack = (total - used).max(0.0);
+            let x0 = match align {
+                Align::Start => self.area.min.x + self.padding.left,
+                Align::Center => self.area.min.x + self.padding.left + slack * 0.5,
+                Align::End => self.area.min.x + self.padding.left + slack,
             };
+            let x = x0 + i as f32 * (w + gap);
             out.push(Rect::from_xywh(x, y, w, self.row_height));
         }
         out
@@ -301,12 +301,26 @@ mod tests {
     }
 
     #[test]
-    fn columns_with_centre_alignment_are_centred() {
+    fn equal_columns_fill_the_row_exactly() {
         let mut l = Layout::new(area());
+        // Equal columns auto-fill, so there is no slack to centre within: the
+        // first column starts at the left edge and the last ends at the right.
         let cols = l.columns(2, 0.0, Align::Center);
-        assert!(cols[0].min.x > 0.0);
-        assert!(cols[1].max.x < 200.0);
-        assert!((cols[0].min.x - 50.0).abs() < 1e-4);
+        assert_eq!(cols.len(), 2);
+        assert!((cols[0].min.x - 0.0).abs() < 1e-4, "{cols:?}");
+        assert!((cols[0].max.x - 100.0).abs() < 1e-4, "{cols:?}");
+        assert!((cols[1].max.x - 200.0).abs() < 1e-4, "{cols:?}");
+    }
+
+    #[test]
+    fn columns_respect_the_gap() {
+        let mut l = Layout::new(area());
+        let cols = l.columns(3, 10.0, Align::Start);
+        assert_eq!(cols.len(), 3);
+        // (200 - 2*10) / 3 = 60 wide each.
+        assert!((cols[0].width() - 60.0).abs() < 1e-4, "{cols:?}");
+        assert!((cols[1].min.x - 70.0).abs() < 1e-4, "{cols:?}");
+        assert!((cols[2].max.x - 200.0).abs() < 1e-4, "{cols:?}");
     }
 
     #[test]

@@ -244,7 +244,10 @@ pub struct InputState {
     pub click_slop: f32,
     pub now: f64,
     last_down_pos: Vec2,
-    last_down_time: f64,
+    /// When the current press began. `Option` rather than a sentinel `0.0`:
+    /// the very first click of a session legitimately lands at t == 0, and
+    /// `last_down_time > 0.0` silently discarded it.
+    last_down_time: Option<f64>,
     drag_distance: f32,
     /// Set by `MouseUp`, consumed by [`InputState::take_click`].
     pending_click: Option<(Vec2, MouseButton)>,
@@ -271,7 +274,7 @@ impl InputState {
                 self.mouse = *pos;
                 self.pressed.push(*button);
                 self.last_down_pos = *pos;
-                self.last_down_time = now;
+                self.last_down_time = Some(now);
                 self.drag_distance = 0.0;
             }
             Event::MouseDragged { pos, button } => {
@@ -287,8 +290,7 @@ impl InputState {
                 self.released.push(*button);
                 // A release close to where the press happened, within
                 // `click_time`, is a click.
-                if self.last_down_time > 0.0
-                    && (now - self.last_down_time) < 0.5
+                if self.last_down_time.is_some_and(|t| (now - t) < 0.5)
                     && pos.distance(self.last_down_pos) <= self.click_slop
                     && self.drag_distance <= self.click_slop
                 {
@@ -431,6 +433,29 @@ mod tests {
         assert_eq!(btn, MouseButton::Left);
         assert!(pos.distance(Vec2::new(11.0, 10.0)) < 1e-6);
         assert!(i.take_click().is_none(), "click must be consumable once");
+    }
+
+    #[test]
+    fn a_click_at_time_zero_is_still_a_click() {
+        // The press timestamp is used as "have we pressed?" with `Option`, not
+        // with a `> 0.0` sentinel, so the first click of a session -- which lands
+        // at t == 0 -- is not swallowed.
+        let mut i = InputState::new();
+        i.push(
+            &Event::MouseDown {
+                pos: Vec2::new(5.0, 5.0),
+                button: MouseButton::Left,
+            },
+            0.0,
+        );
+        i.push(
+            &Event::MouseUp {
+                pos: Vec2::new(5.0, 5.0),
+                button: MouseButton::Left,
+            },
+            0.0,
+        );
+        assert!(i.take_click().is_some(), "a t=0 click must register");
     }
 
     #[test]
@@ -623,6 +648,14 @@ mod tests {
             0.0,
         );
         assert_eq!(i.viewport.size(), Vec2::new(1920.0, 1080.0));
+        assert_eq!(i.viewport.max, Vec2::new(1920.0, 1080.0));
+        // Hover needs the cursor to have moved; the resize itself does not place it.
+        i.push(
+            &Event::MouseMoved {
+                pos: Vec2::new(1910.0, 1010.0),
+            },
+            0.0,
+        );
         assert!(i.hovered(cad_core::Rect2::from_xywh(1900.0, 1000.0, 20.0, 80.0)));
     }
 }

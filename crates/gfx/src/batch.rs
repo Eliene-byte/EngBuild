@@ -553,9 +553,10 @@ mod tests {
         let mut out = Vec::new();
         stroke_rect(&mut out, Rect::from_xywh(0.0, 0.0, 10.0, 20.0), C, 2.0);
         assert_eq!(out.len(), 24, "four bars of two triangles each");
-        // Top bar: six vertices of the 10x2 rect at the rect's min corner.
+        // Stroke width 2 -> half-width 1, so the top bar is the 10x1 rect at
+        // the min corner; its sixth vertex is that rect's top-left.
         assert_eq!(out[0].pos, [0.0, 0.0]);
-        assert_eq!(out[5].pos, [0.0, 2.0]);
+        assert_eq!(out[5].pos, [0.0, 1.0]);
         // Side bars are inset so corners do not overlap.
         assert_eq!(out[12].pos, [0.0, 1.0]);
         assert_eq!(out[18].pos, [9.0, 1.0]);
