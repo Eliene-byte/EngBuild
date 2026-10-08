@@ -3,6 +3,11 @@
 # One job per platform so a macOS or Linux failure never blocks a Windows
 # release. Artifacts are uploaded per-platform and joined in `release`.
 #
+# Linux needs `libxkbcommon-x11-dev` explicitly: winit's x11 feature dlopens
+# libxkbcommon-x11.so.0, `libxkbcommon-dev` does not provide it, and when the
+# dlopen fails xkbcommon-dl calls abort() -- a core dump with no message, not a
+# recoverable error.
+#
 # Action versions are pinned to the Node 24 majors (checkout v7,
 # upload-artifact v7, download-artifact v8, gh-release v3). The v4/v2 majors
 # still run, but only because the runner forces them onto a Node 24 runtime it
@@ -43,9 +48,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev \
-            libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev \
-            pkg-config
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -208,9 +213,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev \
-            libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev \
-            pkg-config
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev pkg-config
 
       - name: Build
         run: cargo build --release --locked -p cad
@@ -281,9 +286,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             mesa-vulkan-drivers libvulkan1 xvfb \
-            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev \
-            libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev \
-            pkg-config
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev pkg-config
 
       - name: Build
         run: cargo build --release --locked -p cad
