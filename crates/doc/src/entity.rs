@@ -554,7 +554,10 @@ impl Entity {
                     *p += v;
                 }
             }
-            EntityKind::Unknown { .. } => {}
+            // Everything with a 2D curve view returned through the
+            // `as_curve` branch above, so the remainder is the non-curve kinds
+            // plus `Unknown`, which has no geometry to mirror.
+            _ => {}
         }
         out
     }
@@ -646,71 +649,106 @@ impl Entity {
 
     /// Mirror across the line through `center` with direction `dir`.
     ///
-    /// The direction need not be normalised. Mirroring is the one transform
-    /// that can flip an entity's handedness, so it is computed by projecting
-    /// onto the axis and negating the perpendicular component rather than by
-    /// rotating twice: a closed polyline keeps its signed area exactly, which a
-    /// rotate-by-pi-then-rotate-back would only do up to rounding.
+    /// The 2D curve kinds delegate to [`cad_geom::Curve::transformed`], which
+    /// already handles the awkward part: an arc or ellipse only stays one under
+    /// a *similarity* transform, and a mirror is orientation-reversing, so the
+    /// sweep flips and the curve is promoted when it must be. Maintaining a
+    /// second, hand-rolled version of that here is how the two drift apart.
+    ///
+    /// `dir` need not be normalised, and may be zero -- a zero direction has no
+    /// unique mirror line, so the entity is left where it is rather than moved
+    /// somewhere arbitrary.
     pub fn mirrored(&self, center: Vec3, dir: Vec3) -> Entity {
         let mut out = self.clone();
         let c2 = center.xy();
         let d2 = dir.xy();
-        let len2 = d2.length_squared();
-        let mirror = |p: Vec2| {
-            if len2 < 1e-12 {
-                return c2;
-            }
-            let u = d2 * (1.0 / len2);
-            let rel = p - c2;
-            let along = u * rel.dot(u);
-            let perp = rel - along;
-            c2 + along - perp
+        if d2.length_squared() < 1e-12 {
+            return out;
+        }
+        // Translate so the axis passes through the origin, mirror, translate back.
+        let t = cad_geom::xform::Affine2::translation(-c2)
+            .then(cad_geom::xform::Affine2::mirror(d2))
+            .then(cad_geom::xform::Affine2::translation(c2));
+        let m2 = |p: Vec2| t.apply(p);
+        // A mirror in XY also flips Z for genuinely 3D kinds; the 2D overlay
+        // keeps its elevation so a plan drawing stays in plan.
+        let m3 = |p: Vec3| {
+            let q = t.apply(p.xy());
+            Vec3::new(q.x, q.y, p.z)
         };
-        let keep_z = |p: Vec3| Vec3::new(mirror(p.xy()).x, mirror(p.xy()).y, p.z);
-        let mirror3 = |p: Vec3| {
-            let m = mirror(p.xy());
-            Vec3::new(m.x, m.y, -p.z)
+        let m3r = |p: Vec3| {
+            let q = t.apply(p.xy());
+            Vec3::new(q.x, q.y, -p.z)
         };
-        match &mut out.entity {
-            EntityKind::Line(l) => {
-                l.p0 = mirror(l.p0);
-                l.p1 = mirror(l.p1);
-            }
-            EntityKind::Circle(c) => c.center = mirror(c.center),
-            // An arc reverses its sweep when mirrored: the same angle range now
-            // traces the other side of the circle.
-            EntityKind::Arc(a) => {
-                a.center = mirror(a.center);
-                a.start_angle =
-                    (std::f32::consts::PI - a.start_angle).rem_euclid(std::f32::consts::TAU);
-            }
-            EntityKind::Ellipse(e) => e.center = mirror(e.center),
-            EntityKind::Polyline(p) | EntityKind::Region(p) => {
-                for q in &mut p.vertices {
-                    *q = mirror(*q);
+
+        if let Some(curve) = self.as_curve() {
+            let mirrored = curve.transformed(&t);
+            match &mut out.entity {
+                EntityKind::Line(_) => {
+                    out.entity = EntityKind::Line(match mirrored {
+                        cad_geom::Curve::Line(l) => l,
+                        other => return Entity::new(EntityKind::Polyline(as_polyline(&other))),
+                    })
                 }
+                EntityKind::Circle(_) => {
+                    out.entity = match mirrored {
+                        cad_geom::Curve::Circle(c) => EntityKind::Circle(c),
+                        cad_geom::Curve::Polyline(p) => EntityKind::Polyline(p),
+                        other => EntityKind::Polyline(as_polyline(&other)),
+                    }
+                }
+                EntityKind::Arc(_) => {
+                    out.entity = match mirrored {
+                        cad_geom::Curve::Arc(a) => EntityKind::Arc(a),
+                        cad_geom::Curve::Polyline(p) => EntityKind::Polyline(p),
+                        other => EntityKind::Polyline(as_polyline(&other)),
+                    }
+                }
+                EntityKind::Ellipse(_) => {
+                    out.entity = match mirrored {
+                        cad_geom::Curve::Ellipse(e) => EntityKind::Ellipse(e),
+                        cad_geom::Curve::Polyline(p) => EntityKind::Polyline(p),
+                        other => EntityKind::Polyline(as_polyline(&other)),
+                    }
+                }
+                EntityKind::Polyline(_) | EntityKind::Region(_) => {
+                    out.entity = match mirrored {
+                        cad_geom::Curve::Polyline(p) => EntityKind::Polyline(p),
+                        cad_geom::Curve::Line(l) => {
+                            EntityKind::Polyline(Polyline::new(vec![l.p0, l.p1], false))
+                        }
+                        other => EntityKind::Polyline(as_polyline(&other)),
+                    }
+                }
+                _ => {}
             }
+            return out;
+        }
+
+        match &mut out.entity {
             EntityKind::Spline(s) => {
+                // `Curve` has no spline variant, so a spline does not come back
+                // from `as_curve`; transform its control points directly.
                 for seg in &mut s.segments {
                     for p in seg.p.iter_mut() {
-                        *p = mirror(*p);
+                        *p = m2(*p);
                     }
                 }
                 for p in &mut s.control_points {
-                    *p = mirror(*p);
+                    *p = m2(*p);
                 }
             }
+            EntityKind::Point(p) => p.position = m3(p.position),
             EntityKind::Text(t) => {
-                let m = mirror(t.insert.xy());
-                t.insert = Vec3::new(m.x, m.y, t.insert.z);
-                // A mirrored glyph run reads backwards unless the rotation is
-                // flipped too.
+                let q = m2(t.insert.xy());
+                t.insert = Vec3::new(q.x, q.y, t.insert.z);
+                // A mirrored glyph run reads backwards unless the rotation flips.
                 t.rotation = -t.rotation;
             }
             EntityKind::Hatch(h) => {
                 for l in &mut h.loops {
                     for q in &mut l.vertices {
-                        *q = mirror(*q);
+                        *q = m2(*q);
                     }
                 }
                 h.pattern_angle = -h.pattern_angle;
@@ -718,34 +756,36 @@ impl Entity {
             EntityKind::Box(b) => {
                 // Swap opposite corners: the axis-aligned box stays axis-aligned.
                 let (mn, mx) = (b.min, b.max);
-                b.min = keep_z(mx);
-                b.max = keep_z(mn);
-            }
-            EntityKind::Point(p) => p.position = keep_z(p.position),
-            EntityKind::Construction(c) => {
-                c.from = keep_z(c.from);
-                c.to = keep_z(c.to);
-            }
-            EntityKind::Insert(i) => {
-                i.position = keep_z(i.position);
-                i.rotation = -i.rotation;
-                i.scale.y = -i.scale.y;
+                b.min = m3(mx);
+                b.max = m3(mn);
             }
             EntityKind::Face(f) => {
                 for p in &mut f.loop_pts {
-                    *p = mirror3(*p);
+                    *p = m3r(*p);
                 }
                 let n = f.plane.n;
                 f.plane = Plane3::new(Vec3::new(n.x, n.y, -n.z), f.plane.d);
             }
+            EntityKind::Construction(c) => {
+                c.from = m3(c.from);
+                c.to = m3(c.to);
+            }
+            EntityKind::Insert(i) => {
+                i.position = m3(i.position);
+                i.rotation = -i.rotation;
+                i.scale.y = -i.scale.y;
+            }
             EntityKind::Mesh(m) => {
                 for p in &mut m.positions {
-                    *p = mirror3(*p);
+                    *p = m3r(*p);
                 }
                 // Winding flips, so recompute rather than transform the normals.
                 m.recompute_normals();
             }
-            EntityKind::Unknown { .. } => {}
+            // Everything with a 2D curve view returned through the
+            // `as_curve` branch above, so the remainder is the non-curve kinds
+            // plus `Unknown`, which has no geometry to mirror.
+            _ => {}
         }
         out
     }
@@ -822,6 +862,30 @@ impl Entity {
             }
             EntityKind::Insert(i) => vec![i.position.xy()],
             _ => Vec::new(),
+        }
+    }
+}
+
+/// Flatten any curve to a polyline, for the cases where a mirror has to change
+/// an entity's type (which only happens when a shape is not a similarity of its
+/// mirror image, i.e. never for a pure mirror -- but the match has to be
+/// total).
+fn as_polyline(c: &cad_geom::Curve) -> Polyline {
+    match c {
+        cad_geom::Curve::Polyline(p) => p.clone(),
+        cad_geom::Curve::Line(l) => Polyline::new(vec![l.p0, l.p1], false),
+        other => {
+            // Flatten to polylines rather than dropping the geometry: a silently
+            // empty entity is much worse than a slightly coarser one.
+            let pts = cad_geom::tessellate::tessellate(
+                other,
+                &cad_geom::tessellate::TessellationOptions::default(),
+            );
+            if pts.len() >= 2 {
+                Polyline::new(pts, false)
+            } else {
+                Polyline::new(Vec::new(), false)
+            }
         }
     }
 }
@@ -944,6 +1008,63 @@ mod tests {
             Entity::solid(Box3d::new(Vec3::ZERO, Vec3::splat(2.0))).measure(),
             Some((8.0, true))
         );
+    }
+
+    #[test]
+    fn mirrored_polyline_reflects_only_the_perpendicular_component() {
+        let square = Polyline::new(
+            vec![
+                Vec2::new(2.0, 1.0),
+                Vec2::new(4.0, 1.0),
+                Vec2::new(4.0, 3.0),
+                Vec2::new(2.0, 3.0),
+            ],
+            true,
+        );
+        let before = Entity::polyline(square.clone()).bounds_2d();
+        // Reflect in the line y = 0 (direction X through the origin).
+        let after = Entity::polyline(square)
+            .mirrored(Vec3::ZERO, Vec3::X)
+            .bounds_2d();
+        assert_eq!(before.min.x, 2.0, "{before:?}");
+        assert_eq!(before.max.x, 4.0, "{before:?}");
+        assert_eq!(after.min.x, 2.0, "x must not move: {after:?}");
+        assert_eq!(after.max.x, 4.0, "x must not move: {after:?}");
+        assert_eq!(after.min.y, -3.0, "{after:?}");
+        assert_eq!(after.max.y, -1.0, "{after:?}");
+    }
+
+    #[test]
+    fn mirrored_circle_keeps_its_radius() {
+        let c = Circle::new(Vec2::new(10.0, 0.0), 4.0);
+        let m = Entity::circle(c).mirrored(Vec3::ZERO, Vec3::Y);
+        match &m.entity {
+            EntityKind::Circle(g) => {
+                assert!((g.center.x + 10.0).abs() < 1e-5, "{:?}", g.center);
+                assert!(g.center.y.abs() < 1e-5, "{:?}", g.center);
+                assert!((g.radius - 4.0).abs() < 1e-5);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn mirrored_arc_flips_its_sweep() {
+        // Mirroring reverses the direction of travel around the centre, so the
+        // sweep has to negate or the arc lands on the wrong side.
+        let a = Arc::from_angles(Vec2::ZERO, 5.0, 0.0, std::f32::consts::FRAC_PI_2);
+        let m = Entity::arc(a).mirrored(Vec3::ZERO, Vec3::Y);
+        match &m.entity {
+            EntityKind::Arc(g) => {
+                assert!(
+                    (g.sweep + std::f32::consts::FRAC_PI_2).abs() < 1e-4,
+                    "{}",
+                    g.sweep
+                );
+                assert!(g.center.x.abs() < 1e-5);
+            }
+            _ => panic!(),
+        }
     }
 
     #[test]

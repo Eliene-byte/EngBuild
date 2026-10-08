@@ -234,11 +234,10 @@ pub fn lift_z(pts: &[Vec2], z: f32) -> Vec<[f32; 3]> {
 
 /// Bounds of a point run, for quick culling before tessellation.
 pub fn points_bounds(pts: &[Vec2]) -> Rect2 {
-    let mut r = Rect2::ZERO;
-    for p in pts {
-        r = r.expand_point(*p);
-    }
-    r
+    // This runs as a culling test before tessellation: a bounds that reaches
+    // back to the origin defeats the cull entirely for geometry in the positive
+    // quadrant, which is most of a drawing.
+    Rect2::of_points(pts)
 }
 
 /// Shortest distance from `p` to the segment `a..b`.
@@ -332,6 +331,20 @@ mod tests {
         let a = Arc::from_angles(Vec2::ZERO, 100.0, 0.0, 0.001);
         let pts = tessellate_arc(a, &TessellationOptions::default());
         assert_eq!(pts.len(), 2);
+    }
+
+    #[test]
+    fn points_bounds_do_not_include_the_origin() {
+        // This is a culling test; a bounds reaching back to the origin defeats
+        // it for almost every real drawing.
+        let b = points_bounds(&[Vec2::new(500.0, 400.0), Vec2::new(520.0, 460.0)]);
+        assert_eq!(b.min, Vec2::new(500.0, 400.0), "{b:?}");
+        assert_eq!(b.max, Vec2::new(520.0, 460.0), "{b:?}");
+    }
+
+    #[test]
+    fn points_bounds_of_nothing_is_empty() {
+        assert!(points_bounds(&[]).is_empty());
     }
 
     #[test]

@@ -17,6 +17,26 @@ impl Rect2 {
         max: Vec2::ZERO,
     };
 
+    /// A rect containing nothing, for accumulating a bounding box.
+    ///
+    /// `ZERO` is the rect *at the origin*, not an identity for `expand_point`:
+    /// growing it can only ever grow away from `(0, 0)`, so any geometry that
+    /// does not contain the origin reports bounds that include it. Every
+    /// "bounds of these points" loop must start here, or from the first point.
+    pub const EMPTY: Self = Self {
+        min: Vec2::splat(f32::INFINITY),
+        max: Vec2::splat(f32::NEG_INFINITY),
+    };
+
+    /// Bounding box of `pts`, or [`Rect2::EMPTY`] when there are none.
+    pub fn of_points(pts: &[Vec2]) -> Self {
+        let mut r = Self::EMPTY;
+        for p in pts {
+            r = r.expand_point(*p);
+        }
+        r
+    }
+
     #[inline(always)]
     pub const fn new(min: Vec2, max: Vec2) -> Self {
         Self { min, max }
@@ -305,6 +325,38 @@ mod tests {
             a.intersect(Rect2::from_xywh(50.0, 50.0, 1.0, 1.0))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn empty_starts_empty_and_absorbs_any_point() {
+        // The failure this prevents: starting from `ZERO` silently pins the
+        // lower corner at the origin.
+        assert!(Rect2::EMPTY.is_empty());
+        let r = Rect2::EMPTY.expand_point(Vec2::new(10.0, 20.0));
+        assert_eq!(r.min, Vec2::new(10.0, 20.0), "{r:?}");
+        assert_eq!(r.max, Vec2::new(10.0, 20.0));
+        // A single point has no extent on either axis, which `is_empty` counts
+        // as empty; that is the documented meaning, not a bug.
+        assert!(r.is_empty(), "a single point has no extent: {r:?}");
+        let r = r.expand_point(Vec2::new(14.0, 26.0));
+        assert_eq!(r.min, Vec2::new(10.0, 20.0), "{r:?}");
+        assert_eq!(r.max, Vec2::new(14.0, 26.0));
+        assert!(!r.is_empty());
+        // A point below the origin moves min, which `ZERO` could never do.
+        let r = Rect2::EMPTY.expand_point(Vec2::new(-10.0, -20.0));
+        assert_eq!(r.min, Vec2::new(-10.0, -20.0), "{r:?}");
+    }
+
+    #[test]
+    fn of_points_is_the_true_bounding_box() {
+        let r = Rect2::of_points(&[
+            Vec2::new(3.0, 9.0),
+            Vec2::new(-4.0, 1.0),
+            Vec2::new(2.0, -8.0),
+        ]);
+        assert_eq!(r.min, Vec2::new(-4.0, -8.0), "{r:?}");
+        assert_eq!(r.max, Vec2::new(3.0, 9.0), "{r:?}");
+        assert!(Rect2::of_points(&[]).is_empty());
     }
 
     #[test]

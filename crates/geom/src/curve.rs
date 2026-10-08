@@ -464,10 +464,12 @@ impl Polyline {
         }
     }
     pub fn bounds(&self) -> Rect2 {
-        let mut r = Rect2::ZERO;
-        for v in &self.vertices {
-            r = r.expand_point(*v);
-        }
+        // Starting from `Rect2::ZERO` here made every polyline's bounds include
+        // the origin, because a rect at (0,0) can only grow away from it. That
+        // inflated the spatial index and, worse, made window selection reject
+        // polylines that were entirely inside the window but nowhere near the
+        // origin.
+        let mut r = Rect2::of_points(&self.vertices);
         for i in 0..self.segment_count() {
             if self.bulge_at(i).is_arc() {
                 r = r.union(self.segment_arc(i).bounds());
@@ -742,6 +744,38 @@ mod tests {
         let straight = 10.0 + Vec2::ZERO.distance(Vec2::new(10.0, 10.0));
         let arc_len = p.bulge_at(0).radius(Vec2::ZERO, Vec2::new(10.0, 0.0)) * PI / 2.0;
         assert!((p.perimeter() - (straight + arc_len)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn polyline_bounds_do_not_reach_back_to_the_origin() {
+        // Growing a rect from `Rect2::ZERO` can only grow away from the origin,
+        // so this used to report bounds that included (0, 0) for any polyline in
+        // the positive quadrant. Those bounds feed the spatial index and window
+        // selection, so the bug was visible, not just theoretical.
+        let p = Polyline::new(
+            vec![
+                Vec2::new(100.0, 200.0),
+                Vec2::new(140.0, 200.0),
+                Vec2::new(140.0, 260.0),
+            ],
+            false,
+        );
+        let b = p.bounds();
+        assert_eq!(b.min, Vec2::new(100.0, 200.0), "{b:?}");
+        assert_eq!(b.max, Vec2::new(140.0, 260.0), "{b:?}");
+    }
+
+    #[test]
+    fn polyline_bounds_are_empty_without_vertices() {
+        assert!(Polyline::new(Vec::new(), false).bounds().is_empty());
+    }
+
+    #[test]
+    fn polyline_bounds_handle_negative_coordinates() {
+        let p = Polyline::new(vec![Vec2::new(-5.0, -7.0), Vec2::new(-1.0, -2.0)], false);
+        let b = p.bounds();
+        assert_eq!(b.min, Vec2::new(-5.0, -7.0), "{b:?}");
+        assert_eq!(b.max, Vec2::new(-1.0, -2.0), "{b:?}");
     }
 
     #[test]

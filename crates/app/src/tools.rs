@@ -1139,8 +1139,10 @@ mod tests {
         assert!(matches!(out, ToolOutcome::Changed(_)), "{out:?}");
         match &doc.entities.get(id).unwrap().entity {
             cad_doc::EntityKind::Circle(c) => {
+                // `doc_with_circle` centres the circle on the origin, so the
+                // move by (100, 50) lands it at (100, 50).
                 assert!(
-                    c.center.distance(Vec2::new(110.0, 50.0)) < 1e-4,
+                    c.center.distance(Vec2::new(100.0, 50.0)) < 1e-4,
                     "{:?}",
                     c.center
                 );
@@ -1203,10 +1205,14 @@ mod tests {
 
     #[test]
     fn mirror_reflects_across_the_axis() {
-        let (mut doc, id) = doc_with_circle();
+        // A circle centred on the mirror axis reflects onto itself, which would
+        // prove nothing, so build one off to the side.
+        let mut doc = Document::new();
+        let layer = doc.layers.ensure_default();
+        let id = doc.add(Entity::circle(Circle::new(Vec2::new(10.0, 0.0), 10.0)).with_layer(layer));
         let mut t = Tool::new(ToolId::Mirror);
         t.selection = vec![id];
-        // Axis: the Y axis. The circle at (10, 0) must land at (-10, 0).
+        // Axis: the Y axis, from the origin upward.
         t.on_click(&mut doc, &cam(), Vec2::ZERO, false);
         let out = t.on_click(&mut doc, &cam(), Vec2::new(0.0, 50.0), false);
         assert!(matches!(out, ToolOutcome::Changed(_)), "{out:?}");
@@ -1221,6 +1227,7 @@ mod tests {
             }
             _ => panic!(),
         }
+        assert!(t.state.is_idle());
     }
 
     #[test]
@@ -1239,22 +1246,27 @@ mod tests {
             true,
         );
         let id = doc.add(Entity::polyline(square).with_layer(layer));
-        let area = doc.entities.get(id).unwrap().bounds_2d().size().x
-            * doc.entities.get(id).unwrap().bounds_2d().size().y;
+        let b0 = doc.entities.get(id).unwrap().bounds_2d();
+        let area0 = b0.width() * b0.height();
+
         doc.entities.replace(
             id,
             doc.entities.get(id).unwrap().mirrored(Vec3::ZERO, Vec3::X),
         );
-        let after = doc.entities.get(id).unwrap().bounds_2d().size().x
-            * doc.entities.get(id).unwrap().bounds_2d().size().y;
-        assert!((area - after).abs() < 1e-3, "{area} vs {after}");
+        let b1 = doc.entities.get(id).unwrap().bounds_2d();
+        assert!(
+            (area0 - b1.width() * b1.height()).abs() < 1e-3,
+            "{area0} vs {}",
+            b1.width() * b1.height()
+        );
+
         // And it actually moved: a mirror about a line with direction X through
-        // the origin is a reflection in y, so the whole square lands below the
-        // axis. (Measured on the bounding box rather than a signed area, which
-        // `Curve` does not expose.)
-        let b = doc.entities.get(id).unwrap().bounds_2d();
-        assert!(b.max.y <= 0.0, "{b:?}");
-        assert!((b.min.x - 2.0).abs() < 1e-3, "x must be untouched: {b:?}");
+        // the origin reflects in y, so the whole square lands below the axis
+        // with its x range untouched.
+        assert!((b1.min.x - 2.0).abs() < 1e-3, "x must not move: {b1:?}");
+        assert!((b1.max.x - 4.0).abs() < 1e-3, "x must not move: {b1:?}");
+        assert!((b1.max.y - (-1.0)).abs() < 1e-3, "{b1:?}");
+        assert!((b1.min.y - (-3.0)).abs() < 1e-3, "{b1:?}");
     }
 
     #[test]
