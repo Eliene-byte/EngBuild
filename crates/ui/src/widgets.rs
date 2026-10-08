@@ -869,6 +869,16 @@ mod tests {
                 "{what} left the caret at the wrong place"
             );
             i.end_frame();
+            // `keys_pressed` is edge-triggered, so every press needs its
+            // matching release, exactly as a real keyboard produces them.
+            i.push(
+                &Event::KeyUp {
+                    key,
+                    mods: Modifiers::NONE,
+                },
+                0.0,
+            );
+            i.end_frame();
         }
     }
 
